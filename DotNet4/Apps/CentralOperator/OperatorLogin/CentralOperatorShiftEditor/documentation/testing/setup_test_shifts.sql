@@ -1,0 +1,231 @@
+-- =============================================
+-- Setup 10-Minute Shifts for Fast Testing
+-- =============================================
+-- Creates 96 ten-minute shifts from 06:00 to 22:00
+-- All shifts have DeltaMinus=1, DeltaPlus=1 (1 minute grace period)
+-- Assigns machines 2123 and 2125 to all shifts
+-- This allows for rapid testing without waiting hours
+-- =============================================
+
+USE JEGR_Utils;
+GO
+
+-- =============================================
+-- Step 1: Delete all existing shift assignments
+-- =============================================
+PRINT 'Deleting all shift machine assignments...';
+DELETE FROM tblShiftMachineAssignments;
+GO
+
+-- =============================================
+-- Step 2: Delete all existing shifts
+-- =============================================
+PRINT 'Deleting all shifts...';
+DELETE FROM tblShifts;
+GO
+
+-- Reset identity seed
+DBCC CHECKIDENT ('tblShifts', RESEED, 0);
+GO
+
+-- =============================================
+-- Step 3: Create 10-minute shifts from 06:00 to 22:00
+-- =============================================
+PRINT 'Creating 10-minute shifts from 06:00 to 22:00...';
+
+SET IDENTITY_INSERT tblShifts ON;
+
+DECLARE @ShiftID INT = 1;
+DECLARE @StartHour INT = 6;
+DECLARE @EndHour INT = 22;
+DECLARE @StartMinute INT = 0;
+DECLARE @ShiftDuration INT = 10; -- 10 minutes
+
+DECLARE @CurrentTime TIME;
+DECLARE @EndTime TIME;
+DECLARE @ShiftName VARCHAR(50);
+
+-- Generate shifts
+WHILE @StartHour < @EndHour OR (@StartHour = @EndHour AND @StartMinute = 0)
+BEGIN
+    -- Calculate start and end times
+    SET @CurrentTime = CONVERT(TIME,
+        CAST(@StartHour AS VARCHAR(2)) + ':' +
+        RIGHT('0' + CAST(@StartMinute AS VARCHAR(2)), 2) + ':00');
+
+    -- Calculate end time (add 10 minutes)
+    SET @EndTime = DATEADD(MINUTE, @ShiftDuration, @CurrentTime);
+
+    -- Generate shift name
+    SET @ShiftName = CONVERT(VARCHAR(5), @CurrentTime, 108) + '-' + CONVERT(VARCHAR(5), @EndTime, 108);
+
+    -- Insert shift
+    INSERT INTO tblShifts (ShiftID, ShiftName, StartTime, EndTime, DeltaMinus, DeltaPlus, IsActive, CreatedDate, ModifiedDate)
+    VALUES (@ShiftID, @ShiftName, @CurrentTime, @EndTime, 1, 1, 1, GETDATE(), GETDATE());
+
+    -- Move to next shift
+    SET @ShiftID = @ShiftID + 1;
+    SET @StartMinute = @StartMinute + @ShiftDuration;
+
+    -- Handle hour rollover
+    IF @StartMinute >= 60
+    BEGIN
+        SET @StartHour = @StartHour + 1;
+        SET @StartMinute = 0;
+    END
+END
+
+SET IDENTITY_INSERT tblShifts OFF;
+GO
+
+DECLARE @ShiftCount INT;
+SELECT @ShiftCount = COUNT(*) FROM tblShifts;
+PRINT 'Created ' + CAST(@ShiftCount AS VARCHAR(10)) + ' shifts successfully.';
+GO
+
+-- =============================================
+-- Step 4: Lookup machine RecNum values
+-- =============================================
+PRINT 'Looking up machine RecNum values...';
+
+DECLARE @Machine2123RecNum INT;
+DECLARE @Machine2125RecNum INT;
+
+-- Get RecNum for IdJensen = 2123
+SELECT @Machine2123RecNum = RecNum
+FROM JEGR_DB.dbo.tblMachines
+WHERE IdJensen = 2123;
+
+-- Get RecNum for IdJensen = 2125
+SELECT @Machine2125RecNum = RecNum
+FROM JEGR_DB.dbo.tblMachines
+WHERE IdJensen = 2125;
+
+IF @Machine2123RecNum IS NULL
+BEGIN
+    PRINT 'ERROR: Could not find machine with IdJensen = 2123';
+    RAISERROR('Machine 2123 not found', 16, 1);
+END
+
+IF @Machine2125RecNum IS NULL
+BEGIN
+    PRINT 'ERROR: Could not find machine with IdJensen = 2125';
+    RAISERROR('Machine 2125 not found', 16, 1);
+END
+
+PRINT 'Machine 2123 RecNum: ' + CAST(@Machine2123RecNum AS VARCHAR(10));
+PRINT 'Machine 2125 RecNum: ' + CAST(@Machine2125RecNum AS VARCHAR(10));
+
+-- =============================================
+-- Step 5: Assign machines to all shifts for all days
+-- =============================================
+PRINT 'Assigning machines to all shifts for all days of the week...';
+
+-- Machine 2123 assignments for all days (0=Sunday through 6=Saturday)
+INSERT INTO tblShiftMachineAssignments (ShiftID, MachineRecNum, DayOfWeek, IsActive, CreatedDate)
+SELECT s.ShiftID, @Machine2123RecNum, d.DayOfWeek, 1, GETDATE()
+FROM tblShifts s
+CROSS JOIN (
+    SELECT 0 AS DayOfWeek UNION ALL
+    SELECT 1 UNION ALL
+    SELECT 2 UNION ALL
+    SELECT 3 UNION ALL
+    SELECT 4 UNION ALL
+    SELECT 5 UNION ALL
+    SELECT 6
+) d;
+
+-- Machine 2125 assignments for all days
+INSERT INTO tblShiftMachineAssignments (ShiftID, MachineRecNum, DayOfWeek, IsActive, CreatedDate)
+SELECT s.ShiftID, @Machine2125RecNum, d.DayOfWeek, 1, GETDATE()
+FROM tblShifts s
+CROSS JOIN (
+    SELECT 0 AS DayOfWeek UNION ALL
+    SELECT 1 UNION ALL
+    SELECT 2 UNION ALL
+    SELECT 3 UNION ALL
+    SELECT 4 UNION ALL
+    SELECT 5 UNION ALL
+    SELECT 6
+) d;
+
+GO
+
+PRINT 'Machine assignments completed successfully.';
+GO
+
+-- =============================================
+-- Step 6: Verify the setup
+-- =============================================
+PRINT '';
+PRINT '=============================================';
+PRINT 'Shift Setup Summary (10-Minute Shifts)';
+PRINT '=============================================';
+
+-- Count shifts
+DECLARE @TotalShifts INT;
+SELECT @TotalShifts = COUNT(*) FROM tblShifts;
+PRINT 'Total Shifts Created: ' + CAST(@TotalShifts AS VARCHAR(10));
+
+-- Count assignments
+DECLARE @AssignmentCount INT;
+SELECT @AssignmentCount = COUNT(*) FROM tblShiftMachineAssignments;
+PRINT 'Total Machine Assignments: ' + CAST(@AssignmentCount AS VARCHAR(10));
+
+PRINT '';
+PRINT 'First 10 Shifts:';
+SELECT TOP 10
+    ShiftID,
+    ShiftName,
+    CONVERT(VARCHAR(8), StartTime, 108) AS StartTime,
+    CONVERT(VARCHAR(8), EndTime, 108) AS EndTime,
+    DeltaMinus,
+    DeltaPlus,
+    IsActive
+FROM tblShifts
+ORDER BY ShiftID;
+
+PRINT '';
+PRINT 'Last 10 Shifts:';
+SELECT TOP 10
+    ShiftID,
+    ShiftName,
+    CONVERT(VARCHAR(8), StartTime, 108) AS StartTime,
+    CONVERT(VARCHAR(8), EndTime, 108) AS EndTime,
+    DeltaMinus,
+    DeltaPlus,
+    IsActive
+FROM tblShifts
+ORDER BY ShiftID DESC;
+
+PRINT '';
+PRINT 'Sample Machine Assignments (first 20):';
+SELECT TOP 20
+    sma.AssignmentID,
+    s.ShiftName,
+    m.IdJensen AS MachineID,
+    CASE sma.DayOfWeek
+        WHEN 0 THEN 'Sunday'
+        WHEN 1 THEN 'Monday'
+        WHEN 2 THEN 'Tuesday'
+        WHEN 3 THEN 'Wednesday'
+        WHEN 4 THEN 'Thursday'
+        WHEN 5 THEN 'Friday'
+        WHEN 6 THEN 'Saturday'
+    END AS DayOfWeek,
+    sma.IsActive
+FROM tblShiftMachineAssignments sma
+INNER JOIN tblShifts s ON sma.ShiftID = s.ShiftID
+INNER JOIN JEGR_DB.dbo.tblMachines m ON sma.MachineRecNum = m.RecNum
+ORDER BY m.IdJensen, sma.DayOfWeek, s.ShiftID;
+
+PRINT '';
+PRINT '=============================================';
+PRINT 'NOTE: With 10-minute shifts, you can test:';
+PRINT '  - Auto-logout: Wait 10 minutes for shift to end';
+PRINT '  - Shift transitions: Wait 11-12 minutes for delta+ to expire';
+PRINT '  - Multiple shift cycles: Test entire day in ~3 hours';
+PRINT '=============================================';
+PRINT 'Shift setup completed successfully!';
+PRINT '=============================================';
+GO

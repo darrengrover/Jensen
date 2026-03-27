@@ -1,0 +1,191 @@
+################################################################################
+# Visual Studio / .NET (C#) – repo-root .gitignore
+# Blocks build artefacts, user files, caches, packages, and other junk
+# across every folder and subfolder.
+################################################################################
+
+########################
+# Core build outputs
+########################
+[Bb]in/
+[Oo]bj/
+[Aa]rtifacts/
+[Ll]og/
+[Ll]ogs/
+[Tt]est[Rr]esults/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+[Dd]ebug*/
+[Rr]elease*/
+[Rr]eleases/
+[Pp]ublish*/
+[Dd]ist/
+[Bb]ld/
+
+########################
+# Visual Studio files
+########################
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.rsuser
+*.VC.db
+*.VC.VC.opendb
+*.opendb
+
+########################
+# JetBrains Rider / ReSharper
+########################
+.idea/
+*.sln.iml
+_ReSharper.Caches/
+*.ReSharper
+*.DotSettings.user
+
+########################
+# VS Code workspace
+########################
+.vscode/
+
+########################
+# NuGet / Packages
+########################
+packages/
+.nuget/
+*.nupkg
+*.snupkg
+project.lock.json
+project.assets.json
+*.nuget.props
+*.nuget.targets
+
+########################
+# Build logs & intermediates
+########################
+*.log
+*.binlog
+*.tlog
+*.cache
+*.obj
+*.pdb
+*.ipdb
+*.iobj
+*.ilk
+*.lastcodeanalysissucceeded
+
+########################
+# Test & coverage artefacts
+########################
+*.trx
+*.coverage
+*.coveragexml
+.coverage/
+.coveragexml/
+
+########################
+# ASP.NET / Front-end extras (optional but common)
+########################
+wwwroot/lib/          # LibMan/Bower libraries
+bower_components/
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+########################
+# Publishing / deployment
+########################
+*.PublishSettings
+*.pubxml
+*.pubxml.user
+
+########################
+# Databases & local data
+########################
+*.mdf
+*.ldf
+*.ndf
+*.dbmdl
+*.jfm
+
+########################
+# Diagnostics & traces
+########################
+*.svclog
+*.etl
+*.psess
+*.vsp
+*.vspx
+
+########################
+# Misc generated C/C++ intermediates sometimes produced by toolchains
+########################
+*_i.c
+*_p.c
+*_h.h
+
+########################
+# OS junk
+########################
+[Dd]esktop.ini
+Thumbs.db
+ehthumbs.db
+$RECYCLE.BIN/
+
+########################
+# Local environment/config (keep your canonical envs elsewhere)
+########################
+.env.local
+*.local.settings.json
+
+########################
+# Compiled libraries / binaries (global)
+########################
+*.dll
+*.exe
+*.appx
+*.appxbundle
+*.msi
+*.msix
+*.msixbundle
+*.winmd
+*.so
+*.dylib
+
+# Build output
+bin/
+obj/
+[Bb]uild/
+artifacts/
+*.dll
+*.pdb
+*.exe
+
+# VS / Rider / tooling
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.idea/
+*.DotSettings.user
+
+# Packages / caches / logs
+packages/
+*.nupkg
+*.snupkg
+*.lock.json
+*.log
+*.cache/
+TestResult*/ 
+.vscode/
+
+# Other common junk
+~$*
+*.tmp
+*.bak
+nul
