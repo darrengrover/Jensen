@@ -29,8 +29,9 @@ The scripts only start one after the other has stopped, and disable whichever is
 - [ ] `SHIFT_MANAGEMENT_TEST_PLAN.md` Parts C (legacy parity), A and D passed on the test system
 - [ ] `Switch_To_Shift.cmd` and `Rollback_To_Legacy.cmd` run both ways on a test machine or VM
 - [ ] Files: `CentralLoginServiceSetup_Shift.msi`, `schema.sql`, `rollback_schema.sql`, the two scripts,
-      the Shift Editor Release folder (`CentralOperatorShiftEditor.exe`, `.exe.config`, `DynamicDataLayer.dll`,
-      `MVVMHelpers.dll`, `Newtonsoft.Json.dll`, `DBConnections.xml`)
+      the Shift Editor installer `CentralOperatorShiftEditorSetup.msi` (version 1.0.2) and its `setup.exe`,
+      a `DBConnections.xml` with placeholders (if the site doesn't have its own), and the support tool
+      `CardReaderMonitor.exe`
 - [ ] **Never** take `documentation\testing\setup_test_shifts.sql` - it deletes all shifts
 - [ ] **Never** install the non-shift `CentralLoginServiceSetup.msi` (v1.2.0) on site - it would share the
       current install's folder under a different product identity
@@ -56,13 +57,18 @@ The scripts only start one after the other has stopped, and disable whichever is
    - **Night shifts:** the fixed-time auto-logout (`AutoLogout` / `AutoLogoutTime`, default 23:15) still runs
      in shift mode and would log out night-shift operators - set `AutoLogout` = `False` or move the time
    - Run `sc qc Cockpit_Central_Operator_Shift` - `BINARY_PATH_NAME` must be in the `_Shift` folder
-5. **Shift Editor**
-   - Copy the Shift Editor folder to `C:\Program Files (x86)\Jensen\CentralOperatorShiftEditor\`
-   - Edit `DBConnections.xml`: replace the `SET_SQL_...` placeholders with the site connection
-   - Create a shortcut with **Start in** = the editor folder (it reads `DBConnections.xml` from there)
+5. **Shift Editor** - on each PC that needs it
+   - Run `CentralOperatorShiftEditorSetup.msi` as Administrator (or its `setup.exe`, which installs
+     .NET Framework 4.8 first if the PC doesn't have it). It installs to
+     `C:\Program Files (x86)\Jensen\CentralOperatorShiftEditor\` with a Start-menu and a desktop shortcut,
+     both starting in that folder
+   - Copy the site's `DBConnections.xml` into that folder - the editor reads it from there. If the site
+     doesn't have one yet, use the copy in the kit's `4_Shift_Editor` folder and replace its `SET_SQL_...`
+     placeholders with the site connection. The installer never installs or changes this file, so
+     upgrading or uninstalling the editor leaves it in place
    - Enter the pilot shifts, machine assignments, break start times and operator permissions
    - Overnight shifts (e.g. 22:00-06:00) must be assigned to **both** days they touch
-   - The editor has no login - only give the shortcut to the people who should change shifts
+   - The editor has no login - only install it on the PCs of people who should change shifts
    - Two things are deliberately **not** in the editor and are changed by SQL only (see
      "Settings that are not in the Shift Editor" below): logout at shift end, which is on, and the
      grace minutes, which are 0
@@ -82,6 +88,15 @@ The scripts only start one after the other has stopped, and disable whichever is
    - Unassigned machine: login, logout and moving work as they always have
    - Restart the shift service during a shift and check logins are kept and still held
    - Changes made in the Shift Editor reach the service within about a minute - no restart needed
+
+## Support tool: Card Reader Monitor
+
+`CardReaderMonitor.exe` is a single file with nothing to install (it includes the .NET runtime it needs).
+Copy it to the server that runs the shift service - for example to
+`C:\Program Files (x86)\Jensen\CardReaderMonitor\` - and run it there. It shows each card reader's
+connection, LED colour and logged-in operator as the running shift service sees them, and changes
+nothing. It only works on the same machine as the service, and only with the shift service (the
+current service doesn't publish reader status).
 
 ## Rollback (about 1 minute)
 
