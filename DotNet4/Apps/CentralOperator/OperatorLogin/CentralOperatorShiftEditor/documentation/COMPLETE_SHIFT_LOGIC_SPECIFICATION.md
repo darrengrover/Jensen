@@ -1,15 +1,33 @@
 # COMPLETE SHIFT MANAGEMENT LOGIC SPECIFICATION
 
-**Version:** 1.0
-**Last Updated:** 2025-09-20
+**Version:** 1.1
+**Last Updated:** 2026-10-09
 **Status:** Comprehensive Specification
+**Applies to:** CentralLoginService 1.3.0, TPL.TagReaders 1.0.4, Shift Editor 1.0.2
+
+### What changed in version 1.1 (October 2026)
+
+Agreed by Ge-Mac and Disney on 1 October 2026:
+
+- **Logout at shift end is always on** unless switched off by SQL. `AutoLogoutAtShiftEnd` still exists,
+  but a missing row counts as on and the setting is not shown in the Shift Editor.
+- **Break times.** A shift can have any number of break start times. At each one everyone logged in on
+  the shift is logged out (Rule TM3). Logging back in is up to the operator.
+- **Delta (the grace minutes) defaults to 0** and is not shown in the Shift Editor. The delta rules in
+  this document still work for a shift whose values are set by SQL, but with 0 an operator without
+  permissions cannot log out or move during a shift - they leave at a break or at the shift end.
+- **Shift start rule (Rule TM0).** An operator logged in without a shift is logged out when a shift
+  starts on their machine, whatever the `AutoLogoutAtShiftEnd` setting. The old Rule TM2.2 (give such
+  an operator the shift and keep them logged in) is gone.
+- **Shift data is re-read from the database once a minute**, so Shift Editor changes reach the service
+  within about a minute without a restart.
 
 ---
 
 ## Table of Contents
 
 1. [Core Concepts](#core-concepts)
-2. [Global Settings](#global-settings)
+2. [Global Settings](#global-settings-and-prerequisites)
 3. [ON SERVICE START Logic](#on-service-start-logic)
 4. [EVERY MINUTE Timer Logic](#every-minute-timer-logic)
 5. [AT CARD SCAN Logic](#at-card-scan-logic)
@@ -25,13 +43,19 @@
 A **shift** is a time period when operators work on specific machines. Each shift has:
 - **Start Time** (TimeSpan): e.g., 06:00:00
 - **End Time** (TimeSpan): e.g., 14:00:00
-- **DeltaMinus** (minutes): Grace period BEFORE shift end for manual logout
-- **DeltaPlus** (minutes): Grace period AFTER shift end for manual logout and shift transitions
+- **DeltaMinus** (minutes): Grace period BEFORE shift end for manual logout (normally 0)
+- **DeltaPlus** (minutes): Grace period AFTER shift end for manual logout and shift transitions (normally 0)
+- **Break Times**: Zero or more break start times (times of day inside the shift)
 - **Machine Assignments**: Which machines use this shift
 
 **IMPORTANT**: Shifts are defined by TIME ONLY, not dates. A shift cannot span multiple days (e.g., no 48-hour shifts). Times are compared against server time.
 
 ### Delta Periods
+
+> **Since version 1.1** both delta values default to 0 and the Shift Editor neither shows nor sets
+> them, so normally there is **no** delta window: an operator without permissions is held to the shift
+> until a break or the shift end. Everything below still applies to a shift whose `DeltaMinus` /
+> `DeltaPlus` have been set by SQL (`UPDATE JEGR_Utils.dbo.tblShifts SET DeltaMinus = ..., DeltaPlus = ...`).
 
 The **delta period** is a time window around shift end when manual logout is permitted. Each shift has **two separate delta values**:
 
@@ -61,6 +85,20 @@ Using the example: Shift ends at 14:00, DeltaMinus = 15 min, DeltaPlus = 10 min
    - Shift transitions occur here
    - Shift info is cleared or updated to new shift
 
+### Break Times
+
+A shift can have any number of **break start times** (`JEGR_Utils.dbo.tblShiftBreaks`: `ShiftID`,
+`BreakTime`), entered on the Shift Editor's Breaks tab.
+
+- A break is a time of day strictly between the shift's start and end (for a midnight-crossing shift:
+  after the start or before the end). The same time can appear only once per shift.
+- At a break start time **everyone logged in on that shift is logged out** - on every machine the shift
+  is assigned to, whatever their permissions (Rule TM3).
+- A break has **no end time**. Logging in again, at the same station or another, is up to the operator.
+- A break logout is an ordinary logout record (the same as a card-scan logout).
+- Breaks started on a Jensen kiosk or terminal (log records with SubregType 6) are a different thing and
+  are not affected by this rule.
+
 ### Operator State
 
 Each operator logged into a machine has:
@@ -69,7 +107,10 @@ Each operator logged into a machine has:
 - **Login Time**: When they originally logged in
 - **Active Shift ID**: The shift they were assigned at login (null if no shift was active)
 
-**IMPORTANT**: Only the shift ID is stored. Shift start/end times are **retrieved from the datalayer** each time they're needed for delta calculations. This ensures operators always use the current shift configuration.
+**IMPORTANT**: Only the shift ID is stored, and only in memory. Shift start/end times are **retrieved
+from the datalayer** each time they're needed. This ensures operators always use the current shift
+configuration. The shift ID belongs to the login: **every logout clears it** (card scan, replacement,
+break, shift start, shift end, or a logout made by another application).
 
 ### Station Capacity and MaxLogins
 
@@ -184,13 +225,17 @@ When the system needs to check delta periods or perform shift-related calculatio
 
 **ALL shift management rules documented in this specification ONLY apply when BOTH conditions are met:**
 
-1. **`UseShiftManagement = true`** (database setting)
+1. **`UseShiftManagement = true`** (service config setting)
 2. **Machine has an active shift assigned**
 
 **If EITHER condition is false:**
 - All shift management logic is bypassed
-- Legacy operator login/logout logic applies
-- This is **OUT OF SCOPE** for this specification
+- Legacy operator login/logout logic applies - **exactly the pre-shift behaviour**, which must still
+  be implemented and tested: scanning logs the operator in (or out at their own station), a
+  MaxLogins = 1 station logs out its occupant first, a full multi-login station refuses, and
+  scanning elsewhere logs the operator out there and in here
+- The legacy rules are unchanged, so they are not re-specified here ("OUT OF SCOPE" below means
+  "shift rules don't apply - use legacy logic", not "nothing to do")
 
 **This prerequisite applies to:**
 - Auto-logout checks
@@ -200,170 +245,196 @@ When the system needs to check delta periods or perform shift-related calculatio
 - All replacement and movement rules
 
 ### UseShiftManagement
-- **Type**: Boolean (database setting)
+- **Type**: Boolean (service config setting in `CentralLoginService.exe.config`, written by the
+  installer: `true` by the Shift MSI, `false` by the standard MSI - not a database setting)
 - **Purpose**: Master switch for shift management
-- **When FALSE**: Legacy logic applies (OUT OF SCOPE)
+- **When FALSE**: Legacy logic applies (see prerequisite above)
 - **When TRUE**: Shift rules apply (IF machine has active shift)
 
 ### AutoLogoutAtShiftEnd
-- **Type**: Boolean (database setting)
+- **Type**: Boolean (database setting, `JEGR_Utils.dbo.tblShiftSettings`)
 - **Purpose**: Controls automatic logout when shift ends
-- **When FALSE**: Operators must manually logout, can stay logged in past shift end
-- **When TRUE**: Operators are automatically logged out when their shift ends (at shift end time, NOT after delta+)
+- **Default: ON.** `schema.sql` seeds `'True'`, and the service treats a missing row, or any value that
+  is not `False`, `0`, `No` or `Off`, as on
+- **Not shown in the Shift Editor.** It can only be changed by SQL (Ge-Mac support):
+  `UPDATE JEGR_Utils.dbo.tblShiftSettings SET SettingValue = 'False', ModifiedDate = GETDATE() WHERE SettingName = 'AutoLogoutAtShiftEnd'`
+- **When ON**: Operators are automatically logged out when their shift ends (at shift end time, NOT after delta+)
+- **When OFF**: Operators are not logged out at shift end. Once delta+ has passed they move to the
+  shift that follows on the machine, or are released from shift rules if there is none (Rule TM2)
+- The setting does **not** affect the shift start rule (TM0) or breaks (TM3)
+- The service logs one line when the value it is using changes, including at start:
+  `[AutoLogout] Logout at shift end is ON` / `... is OFF (...)`
 
 ### Shift Configuration Changes
-- **IMPORTANT**: Changing from "using shifts" to "not using shifts" (or vice versa) requires a service restart
-- On restart, the SERVICE START rules apply
+- The service re-reads shifts, machine assignments, break times, shift settings and operator settings
+  from the database **once a minute** (and at start). A change saved in the Shift Editor, or made by
+  SQL, takes effect within about a minute - no restart
+- If a table cannot be read, the previous contents stay in use and one `[Reload] Loading shift data
+  failed` line is logged (at most once a minute)
+- **Assigning a machine to a shift that is already running** makes every operator on that machine "logged
+  in without a shift while a shift is running": Rule TM0 logs them out at the next check
+- **Moving a running shift's end time into the past** logs out everyone on it at the next check (Rule TM1)
+- `UseShiftManagement` itself is a service config value: changing it needs a service restart, and on
+  restart the SERVICE START rules apply
 
 ---
 
 ## ON SERVICE START Logic
 
-When the service starts, it must recover operator states from the database (opstate).
+When the service starts, it reads the shift data and then recovers operator states from the database
+(the latest login/logout record of each operator).
 
 ### Rule SS1: Operator Was Logged In Before Service Stopped
 
-**FOR EACH** operator in opstate with a login record:
+**FOR EACH** operator whose latest record is a login:
 
-1. **Find the machine** the operator was logged into (from opstate)
+1. **Restore the login** at its machine and station with its **original login time**
 
-2. **Check if machine still exists**
-   - **IF machine no longer exists**:
-     - Log operator out
-     - Log: "Service Start | Operator {id} logged out - machine {machineId} no longer exists"
-     - DONE
-
-3. **Determine if there was a shift covering the operator's original login time**
-   - Use the operator's **original login time** (when they first logged in, NOT current time)
+2. **Determine if there was a shift covering the operator's original login time**
+   - Use the operator's original login time (NOT current time)
    - Get from datalayer: "Was there a shift assigned to this machine that was active at {original login time}?"
 
-4. **IF THERE IS A SHIFT covering the login time**:
-   - Assign that shift to the operator:
-     - `ActiveShiftId` = shift ID
+3. **IF THERE IS A SHIFT covering the login time**:
+   - `ActiveShiftId` = shift ID
    - Keep operator logged in
-   - Log: "Service Start | Operator {id} assigned to shift {shiftId}"
-   - NOTE: Shift times will be retrieved from datalayer when needed for delta calculations
+   - Log: "[ServiceStart] Operator {id} ... Assigned to shift {name} covering original login time"
+   - If that shift has since ended, the first minute check deals with it (Rule TM1 logs the operator
+     out; with `AutoLogoutAtShiftEnd` off, Rule TM2 moves or releases them)
 
-5. **IF NO SHIFT covered the login time**:
-   - Determine if the machine has a **current active shift** (active NOW at service start time)
+4. **IF NO SHIFT covered the login time**:
+   - Restore the operator **without** shift info (`ActiveShiftId` = null). Nothing else happens here
 
-   - **IF THIS MACHINE IS NOT USING SHIFTS**:
-     - Keep operator logged in with no shift info
-     - `ActiveShiftId` = null
-     - Log: "Service Start | Operator {id} kept logged in - machine not using shifts"
+**ONCE EVERY RECORD HAS BEEN PROCESSED**, apply the shift start rule (Rule TM0) to everyone:
 
-   - **IF THERE IS AN ACTIVE MACHINE SHIFT** (now):
-     - Log operator out
-     - Log: "Service Start | Operator {id} logged out - did not log into current active shift"
-     - Rationale: They were logged in during a different period and never joined this current shift
+- An operator restored without a shift, on a machine whose shift is running **now**, is logged out
+  (Log: "[ShiftStart] Operator {id} ... logged out - logged in without a shift and shift {name} is running")
+- An operator restored without a shift on a machine with no shift running stays logged in, free of
+  shift rules
+
+The logouts are applied after the loop, not inside it, because a logout changes the list of records
+being processed.
+
+The first minute check then runs straight away (see below), so a break that passed while the service
+was stopped - up to five minutes ago - is also applied at start.
+
+**The same processing runs whenever the service picks up login records written by another
+application**, and after an operator-table reload. On a reload each logged-in operator keeps the shift
+they already had (it is not re-derived), provided they are still at the same station.
 
 ---
 
 ## EVERY MINUTE Timer Logic
 
-The service runs these checks **once per minute** (when the minute changes).
+The service runs these checks **once per minute** (on the first timer tick after the minute changes,
+and on the first tick after a start). They run **before** that tick's card scans, so a scan in the first
+moments of a shift, a break or the end of a shift already sees the new state.
 
 ### Order of Operations
 
 **CRITICAL**: Execute in this exact order:
 
-1. **Auto-Logout Check** (if enabled)
-2. **Shift Transition Check**
+1. **Refresh shift data** from the database (shifts, assignments, breaks, settings, operator settings)
+2. **Shift Start Check** (Rule TM0)
+3. **Auto-Logout Check** (Rule TM1 - if enabled)
+4. **Shift Transition Check** (Rule TM2)
+5. **Break Check** (Rule TM3)
+
+None of the rules acts on an operator who is not at a station (machine ID <= 0 - the state a break
+started on a Jensen kiosk leaves), except that Rule TM1 releases such an operator from an ended shift
+without writing a logout.
+
+### Rule TM0: Shift Start Check
+
+Applies whatever `AutoLogoutAtShiftEnd` is set to - it is a rule of shift logging.
+
+**FOR EACH** logged-in operator **without** shift info (`ActiveShiftId` is null):
+
+1. **Get the current active shift for the operator's machine** (active RIGHT NOW)
+2. **IF there IS a current active shift:**
+   - Log operator out (ordinary logout record)
+   - Set LED to RED at their station once nobody is left logged in there
+   - Log: "[ShiftStart] Operator {id} at Machine {m}, Sub {s} logged out - logged in without a shift and shift {name} is running on the machine"
+3. **IF there IS NO current active shift:** no action - shift rules don't apply to this machine now
+
+This is what happens to a login made in a gap when the next shift starts, to a login made before
+shift management had anything to say about the machine, and to a machine added to a running shift.
+An operator who scans in a few seconds before a shift starts is logged out at the start and scans again.
 
 ### Rule TM1: Auto-Logout Check
 
-**ONLY IF** `AutoLogoutAtShiftEnd` is enabled:
+**ONLY IF** `AutoLogoutAtShiftEnd` is on (the default):
 
-**FOR EACH** logged-in operator:
+**FOR EACH** logged-in operator with shift info:
 
-1. **Check if operator has shift info**
-   - IF `ActiveShiftId` is null → SKIP (no shift to auto-logout from)
+1. **Get shift details from datalayer** using `ActiveShiftId`
+   - IF shift not found → leave the operator to Rule TM2 (which runs next)
 
-2. **Get shift details from datalayer**
-   - Get shift object using `ActiveShiftId`
-   - IF shift not found (datalayer returns null) → Clear operator's `ActiveShiftId` and SKIP
-   - Get shift start time, shift end time from shift object
+2. **Determine if the shift is running now**, from the shift's own start and end times:
+   - **Normal shift** (e.g., 06:00-14:00): running when start <= time of day < end
+   - **Midnight-crossing shift** (e.g., 22:00-06:00): running when time of day >= start OR time of day < end
 
-3. **Determine if shift has ended**
-   - Get current time (server time)
-   - Compare to shift end time
-   - Account for midnight crossing (if shift start > shift end)
+3. **IF the shift is not running** (it has ended):
+   - Log operator out immediately (ordinary logout record; `ActiveShiftId` is cleared with the logout)
+   - Set LED to RED at their station once nobody is left logged in there
+   - Log: "[AutoLogout] Operator {id} at Machine {m}, Sub {s} logged out - shift {name} ended at {end}"
 
-4. **Check if we are AT OR PAST shift end time**
-   - **Normal shift** (e.g., 06:00-14:00):
-     - IF current time >= 14:00:00 → Shift has ended
-
-   - **Midnight-crossing shift** (e.g., 22:00-06:00):
-     - IF shift start > shift end (22:00 > 06:00) → crosses midnight
-     - IF current time >= shift end AND current time < shift start → Shift has ended
-     - Example: At 06:01, shift has ended
-
-5. **IF shift has ended**:
-   - Log operator out immediately
-   - Set LED to RED at their station
-   - `IsActiveStation` = false
-   - Clear shift info:
-     - `ActiveShiftId` = null
-   - Log: "Auto-Logout | Operator {id} logged out - shift ended at {shiftEnd}"
-
-**IMPORTANT**: Auto-logout happens at shift end time (14:00), NOT after delta+ expires (14:15).
+**IMPORTANT**: Auto-logout happens at shift end time (14:00), NOT after delta+ expires. Permissions
+make no difference. An operator restored at a service start on a shift that has already ended is
+logged out by the first check.
 
 ### Rule TM2: Shift Transition Check
 
-**ONLY IF** `AutoLogoutAtShiftEnd` is **disabled** OR operator survived auto-logout:
+Has work to do only when `AutoLogoutAtShiftEnd` is **off**, or when a shift was deleted while
+operators were on it.
 
-**FOR EACH** logged-in operator:
+**FOR EACH** logged-in operator with shift info:
 
-1. **Check if operator has shift info**
-   - IF `ActiveShiftId` is null → Check if should assign new shift (Rule TM2.2)
-   - IF `ActiveShiftId` is not null → Check if should transition (Rule TM2.1)
+1. **Get current shift details from datalayer** using the operator's `ActiveShiftId`
 
-#### Rule TM2.1: Transition from Current Shift
+2. **IF the shift still exists:**
+   - IF it is running now → SKIP
+   - IF it has ended but current time <= (most recent shift end + DeltaPlus) → SKIP (grace period)
 
-**IF operator has shift info:**
-
-1. **Get current shift details from datalayer**
-   - Get shift object using operator's `ActiveShiftId`
-   - IF shift not found (datalayer returns null) → Clear `ActiveShiftId` and treat as no shift (go to Rule TM2.2)
-   - Get shift end time, DeltaMinus, and DeltaPlus from shift object
-
-2. **Check if still within delta+ period**
-   - Current time <= (shift end time + DeltaPlus)
-   - Account for midnight crossing
-   - IF YES → SKIP (still in current shift's grace period)
-
-3. **Delta+ has expired** - determine next action:
-
-   **Get the current active shift for this machine:**
-   - Get from datalayer: active shift at this machine RIGHT NOW
+3. **Otherwise** (the shift has ended and delta+ has passed, or the shift no longer exists) - get the
+   current active shift for the operator's machine:
 
    **IF there IS a current active shift:**
-   - Transition operator to new shift:
-     - `ActiveShiftId` = new shift ID
-   - Operator remains logged in
-   - Log: "Shift Transition | Operator {id} transitioned from shift {oldId} to shift {newId}"
+   - `ActiveShiftId` = that shift's ID; operator remains logged in, now held to that shift
+   - Log: "[ShiftTransition] Operator {id} moved to shift {newId} ({name}) - {reason}"
 
    **IF there IS NO current active shift:**
-   - Clear operator's shift info:
-     - `ActiveShiftId` = null
-   - Operator remains logged in (no shift restrictions)
-   - Log: "Shift Transition | Operator {id} shift info cleared - no active shift"
+   - `ActiveShiftId` = null; operator remains logged in with no shift restrictions
+   - Log: "[ShiftTransition] Operator {id} shift info cleared - {reason}, no shift running on the machine"
+   - When a shift later starts on the machine, Rule TM0 logs this operator out
 
-#### Rule TM2.2: Assign Shift to Operator Without Shift Info
+**Removed in version 1.1 - Rule TM2.2** ("assign the running shift to a logged-in operator who has
+none"). Such an operator is now logged out by Rule TM0.
 
-**IF operator has NO shift info** (`ActiveShiftId` is null):
+### Rule TM3: Break Check
 
-1. **Get the current active shift for this machine**
-   - Get from datalayer: active shift RIGHT NOW
+Applies whatever `AutoLogoutAtShiftEnd` is set to.
 
-2. **IF there IS a current active shift:**
-   - Assign shift to operator:
-     - `ActiveShiftId` = shift ID
-   - Log: "Shift Assignment | Operator {id} assigned to shift {shiftId} - shift started while logged in"
+**FOR EACH** logged-in operator with shift info:
 
-3. **IF there IS NO current active shift:**
-   - No action needed
-   - Operator continues without shift info
+1. **Find the most recent start of any of the shift's breaks**: for each break time of the operator's
+   shift, today at that time - or yesterday at that time if today's is still in the future - and take
+   the latest
+2. **IF** that moment is **no more than 5 minutes ago AND** the operator **logged in before it**:
+   - Log operator out (ordinary logout record)
+   - Set LED to RED at their station once nobody is left logged in there
+   - Log: "[Break] Operator {id} at Machine {m}, Sub {s} logged out - break at {HH:mm}"
+3. Otherwise no action
+
+Nothing is remembered between checks, which gives these properties:
+
+- **Everyone on the shift** is logged out, whatever their permissions, on every machine of the shift
+- An operator who logs in again after the break (even seconds after) is **not** logged out again by
+  the same break - their login time is later than the break
+- A check that runs late, or a service start up to 5 minutes after a break, still applies the break
+- A break time added or changed in the Shift Editor applies from the next check. One set to a time
+  less than 5 minutes ago still fires; anything further in the past waits for the next day
+- A midnight-crossing shift needs no special handling
+- An operator carried into a following shift (auto-logout off) is subject to that shift's breaks
 
 ---
 
@@ -920,31 +991,35 @@ OPERATOR A ATTEMPTING TO REPLACE OPERATOR B
 │                    └─ NO → DENY replacement (Orange LED)
 ```
 
-### Decision Tree 4: Auto-Logout Check (Every Minute)
+### Decision Tree 4: Every Minute - Shift Start and Auto-Logout Checks
 
 ```
-EVERY MINUTE CHECK
+EVERY MINUTE (shift data refreshed first)
 │
-├─ AutoLogoutAtShiftEnd enabled?
+├─ SHIFT START CHECK - FOR EACH logged-in operator WITHOUT shift info:
+│  │
+│  └─ Is a shift running on the operator's machine now?
+│     ├─ NO  → No action (legacy rules apply on this machine)
+│     └─ YES → LOG OUT operator, LED RED
+│
+├─ AutoLogoutAtShiftEnd on? (default: on)
 │  │
 │  ├─ NO → Skip to Shift Transition Check
 │  │
-│  └─ YES → FOR EACH logged-in operator:
+│  └─ YES → FOR EACH logged-in operator WITH shift info:
 │        │
-│        ├─ Does operator have shift info?
-│        │  │
-│        │  ├─ NO → Skip this operator
-│        │  │
-│        │  └─ YES → Is current time >= LoginShiftEnd?
-│        │        │  (Account for midnight crossing)
-│        │        │
-│        │        ├─ NO → Skip this operator
-│        │        │
-│        │        └─ YES → AUTO-LOGOUT operator immediately
-│        │                 Clear shift info
-│        │                 Turn LED RED
+│        └─ Is the operator's shift running now?
+│           │  (Account for midnight crossing)
+│           │
+│           ├─ YES → Skip this operator
+│           │
+│           └─ NO → AUTO-LOGOUT operator immediately
+│                   Shift info cleared with the logout
+│                   Turn LED RED
 │
-└─ SHIFT TRANSITION CHECK (for operators who weren't auto-logged out)
+├─ SHIFT TRANSITION CHECK (Decision Tree 5)
+│
+└─ BREAK CHECK (Decision Tree 7)
 ```
 
 ### Decision Tree 5: Shift Transition Check (Every Minute)
@@ -952,59 +1027,65 @@ EVERY MINUTE CHECK
 ```
 SHIFT TRANSITION CHECK (runs after auto-logout check)
 │
-FOR EACH logged-in operator:
+FOR EACH logged-in operator WITH shift info:
+│  (operators without shift info are handled by the Shift Start Check)
 │
-├─ Does operator have shift info?
+├─ Does the operator's shift still exist?
 │  │
-│  ├─ NO → Get current active shift at operator's machine
-│  │     │
-│  │     ├─ Active shift exists?
-│  │     │  ├─ YES → Assign shift to operator
-│  │     │  └─ NO  → No action
+│  ├─ YES → Is it running now?
+│  │        ├─ YES → Skip
+│  │        └─ NO  → Is current time <= (most recent shift end + DeltaPlus)?
+│  │                 ├─ YES → Skip (delta+ grace period)
+│  │                 └─ NO  → continue below
 │  │
-│  └─ YES → Is current time > (LoginShiftEnd + Delta)?
-│        │  (Delta+ period expired?)
-│        │
-│        ├─ NO → Skip (still in delta+ grace period)
-│        │
-│        └─ YES → Get current active shift at operator's machine
-│              │
-│              ├─ Active shift exists?
-│              │  ├─ YES → TRANSITION operator to new shift
-│              │  │         Update ActiveShiftId, LoginShiftStart, LoginShiftEnd
-│              │  │
-│              │  └─ NO  → CLEAR shift info
-│              │           Set ActiveShiftId = null
-│              │           Operator stays logged in without shift restrictions
+│  └─ NO → continue below
+│
+└─ Get current active shift at operator's machine
+   │
+   ├─ Active shift exists → MOVE operator to it (ActiveShiftId = new shift ID)
+   │
+   └─ No active shift     → CLEAR shift info (ActiveShiftId = null)
+                            Operator stays logged in without shift restrictions
 ```
 
 ### Decision Tree 6: Service Start Recovery
 
 ```
-ON SERVICE START
+ON SERVICE START (shift data loaded first)
 │
-FOR EACH operator in opstate with login record:
+FOR EACH operator whose latest record is a login:
 │
-├─ Does operator's machine still exist?
+├─ Restore the login (machine, station, original login time)
+│
+└─ Was there a shift on the machine covering the operator's ORIGINAL login time?
+   │
+   ├─ YES → Assign that shift to operator (ActiveShiftId)
+   │
+   └─ NO  → Restore without shift info
+│
+THEN, once for everyone: SHIFT START CHECK (Decision Tree 4)
+│   → an operator without shift info on a machine whose shift is running now is LOGGED OUT
+│
+THEN: the first EVERY MINUTE checks run on the first timer tick
+```
+
+### Decision Tree 7: Break Check (Every Minute)
+
+```
+BREAK CHECK (runs last)
+│
+FOR EACH logged-in operator WITH shift info:
+│
+├─ Does the operator's shift have any break times?
 │  │
-│  ├─ NO → Log operator out
+│  ├─ NO → Skip
 │  │
-│  └─ YES → Was there a shift covering operator's ORIGINAL login time?
-│        │  (Use LoginTime from opstate)
+│  └─ YES → B = the most recent start of any of them (today, or yesterday if today's is still to come)
 │        │
-│        ├─ YES → Assign that shift to operator
-│        │        (ActiveShiftId, LoginShiftStart, LoginShiftEnd)
-│        │        Keep operator logged in
+│        ├─ Was B more than 5 minutes ago?      → Skip
+│        ├─ Did the operator log in at or after B? → Skip (already back from this break)
 │        │
-│        └─ NO → Is there a current active shift NOW?
-│              │
-│              ├─ NO → Is machine using shifts?
-│              │     │
-│              │     ├─ NO  → Keep operator logged in (no shift info)
-│              │     └─ YES → Log operator out (no shift to join)
-│              │
-│              └─ YES → Log operator out
-│                       (They never joined this current shift)
+│        └─ Otherwise → LOG OUT operator, LED RED
 ```
 
 ---
@@ -1016,19 +1097,12 @@ FOR EACH operator in opstate with login record:
 **Scenario**: Operator has `ActiveShiftId` = 123, but shift 123 no longer exists in database (deleted).
 
 **Handling**:
-- When attempting to get shift by ID, query returns null
-- Treat operator as having NO shift info
-- Clear shift info:
-  - `ActiveShiftId` = null
-  - `LoginShiftStart` = null
-  - `LoginShiftEnd` = null
-- Apply no-shift rules (operator can logout freely)
-- Log: "Shift Error | Shift {123} not found - clearing operator {id} shift info"
-
-**When checked**:
-- During delta period calculations
-- During auto-logout checks
-- During shift transition checks
+- **At the next minute check** (Rule TM2): the operator is moved to the shift running on the machine
+  now, or - if there is none - `ActiveShiftId` is cleared and the operator stays logged in without
+  shift restrictions. They are not logged out for this
+- **At a card scan before that check**: the shift lookup returns null, so `ActiveShiftId` is cleared
+  and the scan is treated under no-shift rules (the operator can log out or move)
+- The shift's break times are deleted with it (database cascade)
 
 ### Edge Case 2: Shift Times Modified While Operator Logged In
 
@@ -1041,13 +1115,15 @@ FOR EACH operator in opstate with login record:
   2. Get current shift times from shift object: 07:00-15:00 (NEW times)
   3. Calculate delta based on NEW times (15:00 end time, not 14:00)
   4. Operator can now logout between 14:45-15:15 (not 13:45-14:15)
-- Operators **immediately use updated shift times** after admin makes changes
-- Datalayer is responsible for keeping shift data current
+- Operators use the updated shift times **within about a minute** of the change (the service re-reads
+  the shift data once a minute)
 
 **Benefits**:
-- No need to notify operators or reload state
-- Changes take effect immediately on next delta check (datalayer provides updated data)
+- No need to notify operators, restart the service or reload state
 - Consistent behavior across all operators in the shift
+
+**Watch out for**: moving the end time of a running shift into the past logs out everyone on it at the
+next check, and the Shift Editor refuses new times that would leave one of the shift's breaks outside it.
 
 ### Edge Case 3: Midnight Crossing Shifts
 
@@ -1109,40 +1185,40 @@ For shift 22:00-06:00:
 ### Edge Case 5: Gap Between Shifts
 
 **Scenario**:
-- Shift A: 06:00-14:00 (Delta = 15 min)
-- **GAP**: 14:15-16:00 (no shift)
+- Shift A: 06:00-14:00
+- **GAP**: 14:00-16:00 (no shift)
 - Shift B: 16:00-22:00
+- Delta 0 (the default)
 
 **Timeline for Operator logged into Shift A at 06:30**:
 
-| Time | Auto-Logout Enabled | Auto-Logout Disabled |
-|------|---------------------|----------------------|
-| 13:45 | Within delta-, can logout | Within delta-, can logout |
-| 14:00 | **AUTO-LOGOUT occurs** | Within delta+, can logout |
-| 14:10 | (already logged out) | Within delta+, can logout |
-| 14:15 | (already logged out) | Delta+ expires → Shift info cleared, stays logged in |
-| 14:20 | (logged out) | No shift info, no restrictions |
-| 16:00 | (logged out) | Shift B starts → Shift B assigned to operator |
+| Time | Auto-Logout On (default) | Auto-Logout Off (set by SQL) |
+|------|--------------------------|------------------------------|
+| 13:59 | Held to Shift A - cannot logout | Held to Shift A - cannot logout |
+| 14:00 | **AUTO-LOGOUT occurs** | Shift A ended → shift info cleared, stays logged in |
+| 14:20 | (logged out; may log in again under legacy rules) | No shift info, no restrictions |
+| 16:00 | A legacy login made in the gap is **logged out** (shift start rule) | **Logged out** (shift start rule) - logs in again to join Shift B |
 
-**Key Point**: After delta+ expires with no new shift, operator stays logged in but shift info is cleared.
+**Key Point**: Whatever the setting, nobody is carried across a gap into the next shift: anyone logged
+in without a shift when a shift starts is logged out and logs in again.
 
 ### Edge Case 6: Back-to-Back Shifts (No Gap)
 
 **Scenario**:
-- Shift A: 06:00-14:00 (Delta = 15 min)
+- Shift A: 06:00-14:00
 - Shift B: 14:00-22:00 (starts exactly when A ends)
+- Delta 0 (the default)
 
 **Timeline for Operator logged into Shift A at 06:30**:
 
-| Time | Auto-Logout Enabled | Auto-Logout Disabled |
-|------|---------------------|----------------------|
-| 13:45 | Within delta-, can logout | Within delta-, can logout |
-| 14:00 | **AUTO-LOGOUT occurs** | Within delta+, can logout, Shift B is now active |
-| 14:10 | (already logged out) | Within delta+, can logout, still in Shift A info |
-| 14:15 | (already logged out) | Delta+ expires → **Transition to Shift B** |
-| 14:20 | (logged out) | In Shift B, subject to Shift B delta rules |
+| Time | Auto-Logout On (default) | Auto-Logout Off (set by SQL) |
+|------|--------------------------|------------------------------|
+| 13:59 | Held to Shift A | Held to Shift A |
+| 14:00 | **AUTO-LOGOUT occurs**; Shift B operators log in from now | Shift A ended, Shift B running → **moved to Shift B**, stays logged in |
+| 14:20 | (logged out) | In Shift B, held to it and subject to its breaks |
 
-**Key Point**: With auto-logout disabled, operator transitions to Shift B after delta+ expires.
+**Key Point**: With auto-logout off, an operator is carried from one shift straight into the next only
+when the shifts are back to back. With a non-zero DeltaPlus the move happens when delta+ expires.
 
 ### Edge Case 7: Multiple Shifts Overlap (Should Be Impossible)
 
@@ -1178,19 +1254,18 @@ For shift 22:00-06:00:
 
 ### Edge Case 9: Delta = 0 (No Grace Period)
 
-**Scenario**: Shift 06:00-14:00 with Delta = 0 minutes.
+**This is the normal configuration since version 1.1.**
+
+**Scenario**: Shift 06:00-14:00 with DeltaMinus = 0 and DeltaPlus = 0.
 
 **Implications**:
-- Delta- period: NONE (14:00-14:00 = 0 duration)
-- Delta+ period: NONE (14:00-14:00 = 0 duration)
-- Operators can ONLY logout exactly at 14:00:00
-- Auto-logout happens at 14:00:00
-- Shift transition happens immediately at 14:00:00
-
-**Handling**:
-- System should still work correctly
-- Very restrictive - operators effectively cannot manually logout
-- Not recommended unless operators have CANLOGOUTOFSHIFT permission
+- There is no delta window: an operator without permissions cannot log out, move station or be
+  replaced by another operator without permissions at any time during the shift
+- Operators leave the shift at a break start time or at the shift end (both automatic), or by scanning
+  at a machine that has no shift running
+- CANLOGOUTOFSHIFT operators can still log out or move at any time; CANREPLACEOPERATOR operators can
+  still take over an occupied station
+- With auto-logout off, the shift transition (Rule TM2) happens at the first check after the shift end
 
 ### Edge Case 10: Service Restart During Delta Period
 
@@ -1225,8 +1300,10 @@ For shift 22:00-06:00:
 - At 14:00 (if auto-logout enabled):
   - All three operators are auto-logged out
   - All LEDs turn RED
-- At 14:16 (if auto-logout disabled):
-  - All three operators transitioned to Shift B (if exists)
+- At a break start time of Shift A:
+  - All three operators are logged out
+- After 14:00 plus delta+ (if auto-logout disabled):
+  - All three operators moved to Shift B (if it is running)
   - Each retains their original login time
 
 **Key Point**: Multiple operators per machine are handled independently.
@@ -1280,6 +1357,11 @@ For shift 22:00-06:00:
 ---
 
 ## Examples and Walkthroughs
+
+> **Examples 1-8 use Delta = 15 minutes** to show how the delta window works. Since version 1.1 delta
+> is 0 unless set by SQL: in these examples every "within delta" logout, move or replacement is then
+> **refused**, and operators leave at a break or at the shift end. "Auto-logout: ENABLED" is the default;
+> "DISABLED" means the setting was switched off by SQL. Example 9 shows a normal day under the 1.1 rules.
 
 ### Example 1: Basic Shift Day with Auto-Logout Enabled
 
@@ -1374,8 +1456,8 @@ For shift 22:00-06:00:
 | Time | Event | System Response | Operator State |
 |------|-------|-----------------|----------------|
 | 14:15 | Minute timer check | Shift info cleared | Logged in, ActiveShiftId = null |
-| 16:00 | Minute timer check | Shift B started → **ASSIGN Shift B** to operator | Logged in, ActiveShiftId = Shift B |
-| 16:05 | Operator 50 scans card (logout attempt) | Query Shift B times, outside delta, DENIED | Still logged in, ActiveShiftId = Shift B |
+| 16:00 | Minute timer check | Shift B started, operator has no shift → **LOGGED OUT** (shift start rule), LED RED | Logged out |
+| 16:05 | Operator 50 scans card | Login + Shift B assigned, LED GREEN | Logged in, ActiveShiftId = Shift B |
 
 ### Example 4: Operator Replacement Scenario
 
@@ -1466,16 +1548,22 @@ For shift 22:00-06:00:
 
 5. Keep operator logged in
 
-**Next Minute Timer Check** (16:31):
+**First Minute Timer Check** (straight after the start):
+
+*Auto-logout on (the default):*
 
 1. Operator 50 has Shift A info
-2. Current time (16:31) > Shift A end (14:00) + Delta (15 min) = 14:15
-3. Delta+ has expired
-4. Get current active shift at Machine 100 → Shift B (14:00-22:00)
-5. **TRANSITION** operator to Shift B:
-   - `ActiveShiftId` = Shift B ID
-   - `LoginShiftStart` = 14:00
-   - `LoginShiftEnd` = 22:00
+2. Shift A is not running at 16:30 - it ended at 14:00 while the service was stopped
+3. **AUTO-LOGOUT**: operator 50 is logged out, LED RED
+
+**Result**: Operator 50 is logged out and scans in again to join Shift B.
+
+*Auto-logout off (set by SQL):*
+
+1. Operator 50 has Shift A info
+2. Current time (16:30) > Shift A end (14:00) + DeltaPlus → delta+ has expired
+3. Get current active shift at Machine 100 → Shift B (14:00-22:00)
+4. **MOVE** operator to Shift B (`ActiveShiftId` = Shift B ID)
 
 **Result**: Operator 50 is now in Shift B and can continue working.
 
@@ -1507,30 +1595,64 @@ For shift 22:00-06:00:
 | 22:30 | Operator 50 scans card | Login + Shift A assigned | Logged in, ActiveShiftId = Shift A |
 | 06:15 (next day) | Minute timer check (auto-logout disabled) | Query Shift A times, delta+ expired, Shift B active → **TRANSITION** to Shift B | Logged in, ActiveShiftId = Shift B |
 
+### Example 9: A Normal Day Under the Version 1.1 Rules
+
+**Setup**:
+- Machine 100, Station 1 (MaxLogins = 1) and Station 2
+- Shift A: 06:00-14:00, break start times 09:30 and 12:00, Delta 0
+- Auto-logout: on (default)
+- Operator 50 (no special permissions), Operator 60 (CANLOGOUTOFSHIFT)
+
+**Timeline**:
+
+| Time | Event | System Response | Operator State |
+|------|-------|-----------------|----------------|
+| 05:58 | Operator 50 scans at Station 1 | No shift running → legacy login, LED GREEN | Logged in, no shift |
+| 06:00 | Minute timer check | Shift A running, operator has no shift → **LOGGED OUT** (shift start rule), LED RED | Logged out |
+| 06:02 | Operator 50 scans at Station 1 | Login + Shift A assigned, LED GREEN | Logged in, ActiveShiftId = Shift A |
+| 08:00 | Operator 50 scans at Station 1 (logout attempt) | Held to Shift A → DENIED, LED ORANGE | Still logged in |
+| 08:05 | Operator 50 scans at Station 2 (move attempt) | Held to Shift A → DENIED, LED ORANGE at Station 2 | Still at Station 1 |
+| 08:10 | Operator 60 scans at Station 2, and again at 08:40 | Login + Shift A; second scan: CANLOGOUTOFSHIFT → logout allowed | Op 60 logged out |
+| 09:30 | Minute timer check | Break → everyone on Shift A **LOGGED OUT**, LEDs RED | Logged out |
+| 09:44 | Operator 50 scans at Station 2 | Login + Shift A assigned (any free station), LED GREEN | Logged in Station 2, ActiveShiftId = Shift A |
+| 09:45 | Minute timer check | Break at 09:30 was more than 5 minutes ago, and login is later anyway → no action | Logged in |
+| 12:00 | Minute timer check | Break → **LOGGED OUT** | Logged out |
+| 12:01 | Operator 50 scans at Station 2 | Login + Shift A assigned (logged in after the break → not logged out again) | Logged in |
+| 14:00 | Minute timer check | Shift A ended → **AUTO-LOGOUT**, LED RED | Logged out |
+
 ---
 
 ## Summary of Key Rules
 
-### When Auto-Logout is ENABLED:
-1. Operators are logged out AT shift end time (14:00)
-2. Delta- period allows manual logout before shift ends
-3. Operators never reach delta+ period (already logged out)
+### Always (whatever the AutoLogoutAtShiftEnd setting):
+1. A login during a shift joins that shift; every logout clears the shift
+2. An operator on a shift is held to it: no logout, move or replacement by an operator without
+   permissions, except inside the delta window - and delta is 0 unless set by SQL
+3. At each break start time everyone on the shift is logged out; logging back in is up to them
+4. An operator logged in without a shift is logged out when a shift starts on their machine
 
-### When Auto-Logout is DISABLED:
-1. Operators can stay logged in past shift end
-2. Delta- and delta+ both allow manual logout
-3. After delta+ expires (14:15):
-   - IF new shift active → Transition to new shift
-   - IF no shift active → Clear shift info, stay logged in
+### When Auto-Logout is ON (the default):
+1. Operators are logged out AT shift end time (14:00)
+2. Operators never reach the delta+ period (already logged out)
+
+### When Auto-Logout is OFF (set by SQL):
+1. Operators stay logged in past shift end
+2. At shift end plus DeltaPlus:
+   - IF another shift is running on the machine → Moved to that shift (held to it, subject to its breaks)
+   - IF no shift is running → Shift info cleared, stay logged in; logged out when the next shift starts
 
 ### Permission Summary:
-- **CANLOGOUTOFSHIFT**: Bypass all shift logout restrictions (can logout anytime)
+- **CANLOGOUTOFSHIFT**: Bypass shift logout restrictions on a card scan (can logout or move anytime)
 - **CANREPLACEOPERATOR**: Can replace other operators OR move between machines during shift (only when replacing someone)
+- Neither permission affects breaks, the shift start rule or the shift-end logout
 
 ### Critical Timing:
-- **Shift End (14:00)**: Auto-logout occurs here (if enabled)
-- **Delta+ Expiration (14:15)**: Shift transitions occur here
-- **Delta Window (13:45-14:15)**: Manual logout allowed here
+- **Shift Start**: Logins made without a shift are logged out here
+- **Break Start Times**: Everyone on the shift is logged out here
+- **Shift End (14:00)**: Auto-logout occurs here (if on)
+- **Delta+ Expiration (shift end + DeltaPlus)**: Shift transitions occur here (auto-logout off)
+- **Delta Window**: Manual logout allowed here - empty when delta is 0
+- All of these are applied by the once-a-minute checks, on the first timer tick of the minute
 
 ### Multiple Operators per Machine:
 - Each operator is independent
@@ -1553,12 +1675,15 @@ For shift 22:00-06:00:
 - [ ] Assign only `ActiveShiftId` to recovered operators
 
 ### Timer-Based Checks (Every Minute)
-- [ ] Auto-logout check runs every minute (if enabled)
-- [ ] Get shift details from datalayer before each auto-logout check
-- [ ] Shift transition check runs every minute (after auto-logout check)
-- [ ] Get shift details from datalayer before each transition check
+- [ ] Shift data re-read from the database every minute; a failed read keeps the previous data
+- [ ] Order: refresh, shift start check, auto-logout check, shift transition check, break check
+- [ ] The checks run before the same tick's card scans
+- [ ] Shift start check logs out operators without a shift on a machine whose shift is running (any setting)
+- [ ] Auto-logout check runs unless AutoLogoutAtShiftEnd is switched off; a missing setting row counts as on
 - [ ] Auto-logout happens AT shift end time (not after delta+)
-- [ ] Shift transitions happen AFTER delta+ expires
+- [ ] Shift transitions happen AFTER delta+ expires; operators without a shift are never given one by the timer
+- [ ] Break check logs out everyone on the shift who logged in before a break that started in the last 5 minutes
+- [ ] Timed rules skip operators who are not at a station (machine ID <= 0)
 
 ### Card Scan Logic
 - [ ] Get shift details from datalayer before each delta period check
@@ -1632,7 +1757,10 @@ For shift 22:00-06:00:
 - **Get Shift from Datalayer**: Process of retrieving current shift details from datalayer using shift ID
 - **Station**: A location on a machine with a card reader (multiple stations per machine possible)
 - **Shift Transition**: Moving operator from one shift to another (happens after delta+ expires)
-- **Auto-Logout**: Automatic logout when shift ends at shift end time (if enabled)
+- **Auto-Logout**: Automatic logout when shift ends at shift end time (on unless `AutoLogoutAtShiftEnd` is switched off by SQL)
+- **Break (Break Start Time)**: A time of day inside a shift at which everyone logged in on the shift is logged out
+- **Shift Start Rule**: An operator logged in without a shift is logged out when a shift starts (or is found running) on their machine
+- **Held to the Shift**: An operator on a shift cannot log out or move by card scan outside the delta window (which is empty when delta is 0)
 - **Remote Logout**: Logging out from one machine to log into another
 - **Replacement**: One operator replacing another at the same station
 - **Shift Not Found**: When datalayer returns null for a shift ID (shift was deleted or doesn't exist)

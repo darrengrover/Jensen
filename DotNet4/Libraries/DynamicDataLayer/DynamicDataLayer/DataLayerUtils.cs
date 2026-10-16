@@ -3328,6 +3328,19 @@ namespace Dynamic.DataLayer
             return recs;
         }
 
+        public ShiftBreaks GetShiftBreaks(ShiftBreaks recs, bool noCacheRead)
+        {
+            if (recs == null)
+                recs = new ShiftBreaks();
+            try
+            {
+                recs = (ShiftBreaks)DBDataListSelect(recs, noCacheRead, !noCacheRead);
+            }
+            catch (Exception ex)
+            { }
+            return recs;
+        }
+
         public ShiftSettings GetShiftSettings(ShiftSettings recs, bool noCacheRead)
         {
             if (recs == null)
@@ -3566,6 +3579,65 @@ namespace Dynamic.DataLayer
         {
             get { return createdDate; }
             set { createdDate = AssignNotify(ref createdDate, value, "CreatedDate"); }
+        }
+        #endregion
+    }
+
+    public class ShiftBreaks : DataList
+    {
+        public ShiftBreaks()
+        {
+            Lifespan = 1.0;
+            ListType = typeof(ShiftBreak);
+            TblName = "tblShiftBreaks";
+            DbName = "JEGR_Utils";
+            dBFieldMappings = new DBFieldMappings();
+            dBFieldMappings.AddMapping("BreakID", "BreakID", true, true);
+            dBFieldMappings.AddMapping("ShiftID", "ShiftID");
+            dBFieldMappings.AddMapping("BreakTime", "BreakTime");
+            // CreatedDate is NOT mapped - the database default sets it on insert
+            PropertyInfo[] pInfos = ListType.GetProperties();
+            dBFieldMappings.AddPropertyInfos(pInfos);
+        }
+    }
+
+    /// <summary>
+    /// A break start time within a shift (time of day). Everyone on the shift is logged out at this time.
+    /// </summary>
+    public class ShiftBreak : DataItem
+    {
+        #region private fields
+        private int breakID;
+        private int shiftID;
+        private TimeSpan breakTime;
+        #endregion
+
+        #region public properties
+        public int BreakID
+        {
+            get { return breakID; }
+            set
+            {
+                breakID = AssignNotify(ref breakID, value, "BreakID");
+                ID = breakID;
+                PrimaryKey = breakID;
+            }
+        }
+
+        public int ShiftID
+        {
+            get { return shiftID; }
+            set
+            {
+                shiftID = AssignNotify(ref shiftID, value, "ShiftID");
+                ID2 = shiftID;
+            }
+        }
+
+        public TimeSpan BreakTime
+        {
+            get { return breakTime; }
+            set { breakTime = AssignNotify(ref breakTime, value, "BreakTime"); }
         }
         #endregion
     }

@@ -1,0 +1,2 @@
+# Batch files must keep CRLF line endings (labels and call :label can misbehave with LF)
+*.cmd text eol=crlf

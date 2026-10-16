@@ -32,7 +32,7 @@ namespace TPL.TagReaders
         //private int timercount = 0;
         private ServiceState currentState;
         private System.Timers.Timer timer;
-        private bool isBusy = false;
+        private int isBusy = 0; // 1 while a timer tick is running (set with Interlocked - ticks arrive on pool threads)
         //private int datareadminute = 0;
 
         public delegate void FeedbackDelegate(string feedback);
@@ -254,15 +254,24 @@ namespace TPL.TagReaders
         }
         private void DoTiming(object sender, ElapsedEventArgs e)
         {
-            if (!isBusy)
+            // Only one tick at a time: a tick that arrives while the previous one is still running is skipped
+            if (Interlocked.CompareExchange(ref isBusy, 1, 0) == 0)
             {
-                isBusy = true;
                 try
                 {
                     tagReaders.ReloadData(true);
-                    tagReaders.Read();
 
                     int min = DateTime.Now.Minute;
+                    // Shift rules, once a minute and before the card scans of this tick, so a scan in the
+                    // first moments of a shift, a break or the end of a shift already sees the new state
+                    if (useShiftManagement && min != shiftCheckMinute)
+                    {
+                        shiftCheckMinute = min;
+                        tagReaders.RunShiftChecks();
+                    }
+
+                    tagReaders.Read();
+
                     if (AutoLogout && min != autoLogoutMin && evalLogoutTime())
                     {
                         autoLogoutMin = min; // only check once a minute
@@ -271,25 +280,6 @@ namespace TPL.TagReaders
                         logouts = tagReaders.AutoLogoutNow();
                         lastForcedLogout = DateTime.Today.AddHours(logoutTime.Hour).AddMinutes(logoutTime.Minute);
                         Feedback("Autologout Completed");
-                    }
-                    // Shift-based auto logout and transition (checks its own setting internally)
-                    if (useShiftManagement && min != shiftCheckMinute)
-                    {
-                        shiftCheckMinute = min;
-
-                        // Rule TM1: Auto-Logout Check (if enabled)
-                        int shiftLogouts = tagReaders.AutoLogoutExpiredShifts();
-                        if (shiftLogouts > 0)
-                        {
-                            Feedback($"Shift auto-logout: {shiftLogouts} operators logged out");
-                        }
-
-                        // Rule TM2: Shift Transition Check (runs after auto-logout)
-                        int shiftTransitions = tagReaders.ShiftTransitionCheck();
-                        if (shiftTransitions > 0)
-                        {
-                            Feedback($"Shift transitions: {shiftTransitions} operators transitioned/assigned");
-                        }
                     }
                     if (min % 15 == 0) // every 15 minutes??
                     {
@@ -317,7 +307,7 @@ namespace TPL.TagReaders
                 }
                 finally
                 {
-                    isBusy = false;
+                    Interlocked.Exchange(ref isBusy, 0);
                 }
             }
         }
@@ -381,6 +371,9 @@ namespace TPL.TagReaders
         private ShiftMachineAssignments shiftMachineAssignments;
         private ShiftSettings shiftSettings;
         private OperatorSettings operatorSettings;
+        private ShiftBreaks shiftBreaks;
+        // Logged-in operators' shift info saved across an operator reload (ActiveShiftId is held in memory only)
+        private Dictionary<int, OperatorLoginState> preservedShiftStates = new Dictionary<int, OperatorLoginState>();
 
         private SharedReaderStatus sharedStatus;
         public TPLTagReaders()
@@ -404,7 +397,8 @@ namespace TPL.TagReaders
             shifts = new Shifts();
             shiftMachineAssignments = new ShiftMachineAssignments();
             shiftSettings = new ShiftSettings();
-            operatorSettings = new OperatorSettings();         
+            operatorSettings = new OperatorSettings();
+            shiftBreaks = new ShiftBreaks();
             da = SqlDataAccess.Singleton;
             GetData();        
         }
@@ -448,21 +442,93 @@ namespace TPL.TagReaders
             tcpReader.OnStatusChanged = UpdateSingleReaderStatus;
             TcpReaders.Add(tcpReader);
         }
-        private void getShiftData(bool useCache)
+        /// <summary>
+        /// Reads the shift tables straight from the database into new lists and swaps in each one that
+        /// loaded; a list that fails to load keeps its previous contents. Called at service start and
+        /// once a minute, so Shift Editor changes reach the service within about a minute.
+        /// (Not read through the data layer's cache: its change detection only covers JEGR_DB, so changes
+        /// took up to an hour to arrive, and the cache can clear a list while the service is using it.)
+        /// </summary>
+        private void loadShiftData()
         {
-            if (UseShiftManagement)
+            if (!UseShiftManagement)
+                return;
+
+            string errors = string.Empty;
+
+            Shifts newShifts = new Shifts();
+            newShifts.RaiseException = true;
+            newShifts = da.GetShifts(newShifts, true);
+            if (shiftListLoaded(newShifts, "shifts", ref errors))
+                shifts = newShifts;
+
+            ShiftMachineAssignments newAssignments = new ShiftMachineAssignments();
+            newAssignments.RaiseException = true;
+            newAssignments = da.GetShiftMachineAssignments(newAssignments, true);
+            if (shiftListLoaded(newAssignments, "machine assignments", ref errors))
+                shiftMachineAssignments = newAssignments;
+
+            ShiftSettings newSettings = new ShiftSettings();
+            newSettings.RaiseException = true;
+            newSettings = da.GetShiftSettings(newSettings, true);
+            if (shiftListLoaded(newSettings, "shift settings", ref errors))
+                shiftSettings = newSettings;
+
+            OperatorSettings newOperatorSettings = new OperatorSettings();
+            newOperatorSettings.RaiseException = true;
+            newOperatorSettings = da.GetOperatorSettings(newOperatorSettings, true);
+            if (shiftListLoaded(newOperatorSettings, "operator settings", ref errors))
+                operatorSettings = newOperatorSettings;
+
+            ShiftBreaks newBreaks = new ShiftBreaks();
+            newBreaks.RaiseException = true;
+            newBreaks = da.GetShiftBreaks(newBreaks, true);
+            if (shiftListLoaded(newBreaks, "breaks", ref errors))
+                shiftBreaks = newBreaks;
+
+            if (errors != string.Empty)
             {
-                shifts.RaiseException = true;
-                shifts = da.GetShifts(shifts, !useCache);
+                string hint = errors.IndexOf("Invalid object name", StringComparison.OrdinalIgnoreCase) >= 0
+                    ? " A table is missing - run schema.sql." : string.Empty;
+                reloadError("shift data", errors.Trim() + " The previous values stay in use." + hint);
+            }
+        }
 
-                shiftMachineAssignments.RaiseException = true;
-                shiftMachineAssignments = da.GetShiftMachineAssignments(shiftMachineAssignments, !useCache);
+        private static bool shiftListLoaded(DataList list, string name, ref string errors)
+        {
+            // The data layer's Get... methods swallow exceptions, so a failed read shows as "not updated from the database"
+            if (list.UpdatedFromDB)
+                return true;
+            string[] lines = (list.SelectException ?? string.Empty).Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            errors += name + (lines.Length > 0 ? " (" + lines[0].Trim() + ")" : string.Empty) + "; ";
+            return false;
+        }
 
-                shiftSettings.RaiseException = true;
-                shiftSettings = da.GetShiftSettings(shiftSettings, !useCache);
+        /// <summary>
+        /// The once-a-minute shift rules, in this order: pick up Shift Editor changes, shift start, shift end,
+        /// shift transition, breaks.
+        /// </summary>
+        public void RunShiftChecks()
+        {
+            if (!UseShiftManagement)
+                return;
 
-                operatorSettings.RaiseException = true;
-                operatorSettings = da.GetOperatorSettings(operatorSettings, !useCache);
+            RefreshShiftData();
+            ShiftStartLogoutCheck();
+            AutoLogoutExpiredShifts();
+            ShiftTransitionCheck();
+            BreakLogoutCheck();
+        }
+
+        public void RefreshShiftData()
+        {
+            try
+            {
+                loadShiftData();
+            }
+            catch (Exception ex)
+            {
+                reloadError("shift data", ex.Message);
             }
         }
         private bool OperatorCanReplace(int operatorId)
@@ -505,7 +571,15 @@ namespace TPL.TagReaders
             operatorsRfid = da.GetOperators(operatorsRfid, !useCache);
             getOperatorPermissions(false);
             if (operatorsRfid.UpdatedFromDB)
-            {               
+            {
+                // Save each logged-in operator's shift before the states are rebuilt from RemoteOperatorLog,
+                // otherwise service start recovery (Rule SS1) re-runs on them and can log them out mid-shift
+                preservedShiftStates.Clear();
+                foreach (OperatorLoginState ols in OperatorStates)
+                {
+                    if (ols.IsLoggedIn && ols.ActiveShiftId.HasValue)
+                        preservedShiftStates[ols.OperatorID] = ols;
+                }
                 OperatorStates.Clear();
                 foreach (Operator op in operatorsRfid)
                 {
@@ -591,126 +665,150 @@ namespace TPL.TagReaders
         {
             if (remoteOperatorLogs.UpdatedFromDB || operatorsRfid.UpdatedFromDB)
             {
-                // remoteOperatorLogs is ordered by RemoteOperatorLogId
-                foreach (RemoteOperatorLog log in remoteOperatorLogs)
+                // remoteOperatorLogs is ordered by RemoteOperatorLogId.
+                // Loop over a snapshot: anything that logs an operator out adds to and removes from
+                // remoteOperatorLogs, which would abort a loop over the list itself ("collection was
+                // modified") and leave every later operator unrestored.
+                List<RemoteOperatorLog> logs = remoteOperatorLogs.Cast<RemoteOperatorLog>().ToList();
+                try
                 {
-                    PrintToFile("processRemoteOperatorLog.log", "LogTime: " + log.LogTime + ", RemoteId: " + log.RemoteOperatorLogID + ", State: " + log.State + ", SubregType: " + log.SubregType + ", OperartorId: " + log.OperatorID + ", MachineId: " + log.MachineID + ", SubId: " + log.SubID);
-                    bool isLoggedIn = (log.State == 1) && (log.SubregType == 0);
-                    DateTime loginTime = DateTime.MinValue;
-                    DateTime logoutTime = DateTime.MaxValue;
-                    bool isClockInOut = (log.SubregType == 5);
-                    bool isBreak = (log.SubregType == 6);
-                    if (isLoggedIn)
-                        loginTime = log.LogTime;
-                    else
-                        logoutTime = log.LogTime;
-                    OperatorLoginState opState = (OperatorLoginState)OperatorStates.GetByOperatorID(log.OperatorID);
-
-                    // GUARD: Prevent re-processing logs that were already handled by this service's card scan handler
-                    // This gives card scans priority over processRemoteOperatorLog
-                    // Only process logs from OTHER applications or true service start recovery
-                    if (opState != null && isLoggedIn)
+                    foreach (RemoteOperatorLog log in logs)
                     {
-                        bool alreadyProcessedByCardScan = (
-                            opState.IsLoggedIn &&
-                            opState.MachineID == log.MachineID &&
-                            opState.SubID == log.SubID &&
-                            opState.LoginTime >= log.LogTime
-                        );
-
-                        if (alreadyProcessedByCardScan)
+                        try
                         {
-                            // Card scan handler already processed this login - skip to avoid duplicate processing
-                            // This prevents race condition where timer tick processes card scan before card handler
-                            PrintToFile("processRemoteOperatorLog.log", $"Skipping already-processed login: Operator {log.OperatorID}, Machine {log.MachineID}, LoginTime {opState.LoginTime:HH:mm:ss} >= LogTime {log.LogTime:HH:mm:ss}");
-                            continue;
+                            processRemoteOperatorLogRecord(log);
+                        }
+                        catch (Exception ex)
+                        {
+                            // One bad record must not stop the other operators being restored
+                            feedback($"[Reload] Error restoring Operator {log.OperatorID} from RemoteOperatorLog: {ex.Message}");
                         }
                     }
 
-                    if (opState == null) //shouldn't happen
-                    {
-                        PrintToFile("processRemoteOperatorLog.log", "opState not found so creating");
-                        opState = new OperatorLoginState(log.OperatorID, log.MachineID, log.SubID, loginTime, logoutTime, isLoggedIn, remoteOperatorLogs, logData, machineSubIDs);
-                        OperatorStates.Add(opState);
-                    }
-
-                    if (log.SubregType == 0)
-                    {
-                        opState.ClockedIn = true;
-                        opState.MachineID = log.MachineID;
-                        opState.SubID = log.SubID;
-                        if (isLoggedIn)
-                            opState.LoginTime = loginTime;
-                        else
-                            opState.LogoutTime = logoutTime;
-                        opState.IsLoggedIn = isLoggedIn;
-
-                        // Rule SS1: Service Start Recovery Logic
-                        // Backfill shift info for operators logged in when shift management is enabled
-                        // ONLY backfill if shift info is not already set (prevent overwriting on data refreshes)
-                        // Per spec: Store ONLY the ActiveShiftId, never store shift times
-                        if (UseShiftManagement && isLoggedIn && !opState.ActiveShiftId.HasValue)
-                        {
-                            // Find shift that was covering the operator's ORIGINAL login time (not current time)
-                            Shift loginShift = GetActiveShift(log.MachineID, opState.LoginTime);
-
-                            if (loginShift != null)
-                            {
-                                // Shift was covering login time - assign that shift
-                                opState.ActiveShiftId = loginShift.ShiftID;
-                                feedback($"[ServiceStart] Operator {log.OperatorID} at Machine {log.MachineID}, Sub {log.SubID} - " +
-                                        $"Assigned to shift {loginShift.ShiftName} (ID={loginShift.ShiftID}) covering original login time {opState.LoginTime:HH:mm:ss}");
-                            }
-                            else
-                            {
-                                // No shift covered login time - check if machine has active shift NOW
-                                Shift currentShift = GetActiveShift(log.MachineID);
-
-                                if (currentShift != null)
-                                {
-                                    // Machine has active shift now, but operator didn't log into it
-                                    // Log operator out per spec
-                                    feedback($"[ServiceStart] Operator {log.OperatorID} at Machine {log.MachineID}, Sub {log.SubID} - " +
-                                            $"Logging out: no shift covered original login, but machine has active shift {currentShift.ShiftName} now");
-                                    opState.Logout(DateTime.Now);
-                                }
-                                else
-                                {
-                                    // No shift covering login, no current shift - keep logged in without shift info
-                                    feedback($"[ServiceStart] Operator {log.OperatorID} at Machine {log.MachineID}, Sub {log.SubID} - " +
-                                            $"Kept logged in: no shift covered login, machine not using shifts");
-                                }
-                            }
-                        }
-
-                        PrintToFile("processRemoteOperatorLog.log", "SubregType==0: IsLoggedIn==" + isLoggedIn);
-                    }
-                    if (isClockInOut)
-                    {
-                        opState.ClockedIn = (log.State == 1);
-                        opState.MachineID = -1;
-                        opState.SubID = -1;
-                        PrintToFile("processRemoteOperatorLog.log", "IsClockedIn==" + opState.ClockedIn);
-                    }
-                    if (log.SubregType == 6)
-                    {
-                        opState.ClockedIn = true;
-                        opState.MachineID = -1;
-                        opState.SubID = -1;
-                        if (log.State == 1)
-                        {
-                            opState.BreakID = log.SubregTypeID;
-                        }
-                        else
-                        {
-                            opState.BreakID = -1;
-                        }
-                        PrintToFile("processRemoteOperatorLog.log", "SubregType==6: BreakId==" + opState.BreakID);
-                    }
-
+                    // Rule SS1.3: anyone restored without a shift on a machine whose shift is running now
+                    // is logged out - the same rule as at a shift start, applied once everyone is restored
+                    ShiftStartLogoutCheck();
                 }
-                SetUpdateAllLEDsNow();
-                //DebugOperatorState();
+                finally
+                {
+                    preservedShiftStates.Clear(); // only valid for the rebuild straight after an operator reload
+                    SetUpdateAllLEDsNow();
+                    //DebugOperatorState();
+                }
+            }
+        }
+
+        private void processRemoteOperatorLogRecord(RemoteOperatorLog log)
+        {
+            PrintToFile("processRemoteOperatorLog.log", "LogTime: " + log.LogTime + ", RemoteId: " + log.RemoteOperatorLogID + ", State: " + log.State + ", SubregType: " + log.SubregType + ", OperartorId: " + log.OperatorID + ", MachineId: " + log.MachineID + ", SubId: " + log.SubID);
+            bool isLoggedIn = (log.State == 1) && (log.SubregType == 0);
+            DateTime loginTime = DateTime.MinValue;
+            DateTime logoutTime = DateTime.MaxValue;
+            bool isClockInOut = (log.SubregType == 5);
+            bool isBreak = (log.SubregType == 6);
+            if (isLoggedIn)
+                loginTime = log.LogTime;
+            else
+                logoutTime = log.LogTime;
+            OperatorLoginState opState = (OperatorLoginState)OperatorStates.GetByOperatorID(log.OperatorID);
+
+            // GUARD: Prevent re-processing logs that were already handled by this service's card scan handler
+            // This gives card scans priority over processRemoteOperatorLog
+            // Only process logs from OTHER applications or true service start recovery
+            if (opState != null && isLoggedIn)
+            {
+                bool alreadyProcessedByCardScan = (
+                    opState.IsLoggedIn &&
+                    opState.MachineID == log.MachineID &&
+                    opState.SubID == log.SubID &&
+                    opState.LoginTime >= log.LogTime
+                );
+
+                if (alreadyProcessedByCardScan)
+                {
+                    // Card scan handler already processed this login - skip to avoid duplicate processing
+                    // This prevents race condition where timer tick processes card scan before card handler
+                    PrintToFile("processRemoteOperatorLog.log", $"Skipping already-processed login: Operator {log.OperatorID}, Machine {log.MachineID}, LoginTime {opState.LoginTime:HH:mm:ss} >= LogTime {log.LogTime:HH:mm:ss}");
+                    return;
+                }
+            }
+
+            if (opState == null) //shouldn't happen
+            {
+                PrintToFile("processRemoteOperatorLog.log", "opState not found so creating");
+                opState = new OperatorLoginState(log.OperatorID, log.MachineID, log.SubID, loginTime, logoutTime, isLoggedIn, remoteOperatorLogs, logData, machineSubIDs);
+                OperatorStates.Add(opState);
+            }
+
+            if (log.SubregType == 0)
+            {
+                // A logout, or a login somewhere other than where the service has the operator (made by
+                // another application), ends whatever shift the operator was on. A login gets its shift below.
+                if (!isLoggedIn || !opState.IsLoggedIn || opState.MachineID != log.MachineID || opState.SubID != log.SubID)
+                    opState.ActiveShiftId = null;
+
+                opState.ClockedIn = true;
+                opState.MachineID = log.MachineID;
+                opState.SubID = log.SubID;
+                if (isLoggedIn)
+                    opState.LoginTime = loginTime;
+                else
+                    opState.LogoutTime = logoutTime;
+                opState.IsLoggedIn = isLoggedIn;
+
+                // Rule SS1: Service Start Recovery Logic
+                // Backfill shift info for operators logged in when shift management is enabled
+                // ONLY backfill if shift info is not already set (prevent overwriting on data refreshes)
+                // Per spec: Store ONLY the ActiveShiftId, never store shift times
+                OperatorLoginState preservedState;
+                if (UseShiftManagement && isLoggedIn && !opState.ActiveShiftId.HasValue
+                    && preservedShiftStates.TryGetValue(log.OperatorID, out preservedState)
+                    && preservedState.MachineID == log.MachineID && preservedState.SubID == log.SubID)
+                {
+                    // Operator reload, not a service start - keep the shift the operator already had
+                    opState.ActiveShiftId = preservedState.ActiveShiftId;
+                    feedback($"[Reload] Operator {log.OperatorID} at Machine {log.MachineID}, Sub {log.SubID} - kept shift ID {opState.ActiveShiftId}");
+                }
+                else if (UseShiftManagement && isLoggedIn && !opState.ActiveShiftId.HasValue)
+                {
+                    // Find shift that was covering the operator's ORIGINAL login time (not current time)
+                    Shift loginShift = GetActiveShift(log.MachineID, opState.LoginTime);
+
+                    if (loginShift != null)
+                    {
+                        // Shift was covering login time - assign that shift
+                        opState.ActiveShiftId = loginShift.ShiftID;
+                        feedback($"[ServiceStart] Operator {log.OperatorID} at Machine {log.MachineID}, Sub {log.SubID} - " +
+                                $"Assigned to shift {loginShift.ShiftName} (ID={loginShift.ShiftID}) covering original login time {opState.LoginTime:HH:mm:ss}");
+                    }
+                    // else: no shift covered the login time, so the operator is restored without a shift.
+                    // If a shift is running on the machine now, ShiftStartLogoutCheck (called once every
+                    // record has been processed) logs them out; otherwise they stay logged in, free of shift rules.
+                }
+
+                PrintToFile("processRemoteOperatorLog.log", "SubregType==0: IsLoggedIn==" + isLoggedIn);
+            }
+            if (isClockInOut)
+            {
+                opState.ClockedIn = (log.State == 1);
+                opState.MachineID = -1;
+                opState.SubID = -1;
+                PrintToFile("processRemoteOperatorLog.log", "IsClockedIn==" + opState.ClockedIn);
+            }
+            if (log.SubregType == 6)
+            {
+                opState.ClockedIn = true;
+                opState.MachineID = -1;
+                opState.SubID = -1;
+                if (log.State == 1)
+                {
+                    opState.BreakID = log.SubregTypeID;
+                }
+                else
+                {
+                    opState.BreakID = -1;
+                }
+                PrintToFile("processRemoteOperatorLog.log", "SubregType==6: BreakId==" + opState.BreakID);
             }
         }
         private void DebugOperatorState()
@@ -749,153 +847,140 @@ namespace TPL.TagReaders
             remoteOperatorLogs.UpdateFieldNames = new List<string>();
             remoteOperatorLogs.UpdateFieldNames.Add("Operator_Remote");
         }
+        private bool? lastAutoLogoutAtShiftEnd; // last value reported, so a change is logged once
+
+        /// <summary>
+        /// Operators are logged out when their shift ends unless AutoLogoutAtShiftEnd has been switched off
+        /// in tblShiftSettings. The setting isn't shown in the Shift Editor - it is changed by SQL only.
+        /// A missing row, or a value that isn't recognisably "off", counts as on.
+        /// </summary>
         private bool GetAutoLogoutAtShiftEnd()
         {
-            feedback($"[AutoLogout] GetAutoLogoutAtShiftEnd() called - UseShiftManagement={UseShiftManagement}, shiftSettings={(shiftSettings == null ? "NULL" : $"Count={shiftSettings.Count}")}");
-
-            if (!UseShiftManagement || shiftSettings == null)
+            if (!UseShiftManagement)
                 return false;
+            if (shiftSettings == null)
+                return true;
 
-            ShiftSetting setting = (ShiftSetting)shiftSettings
+            ShiftSetting setting = shiftSettings
                 .OfType<ShiftSetting>()
-                .FirstOrDefault(s => s.SettingName == "AutoLogoutAtShiftEnd");
+                .FirstOrDefault(s => string.Equals(s.SettingName, "AutoLogoutAtShiftEnd", StringComparison.OrdinalIgnoreCase));
 
-            if (setting != null)
-            {
-                bool result = bool.TryParse(setting.SettingValue, out bool parsedValue) && parsedValue;
-                feedback($"[AutoLogout] Setting found: SettingValue='{setting.SettingValue}', Parsed={result}");
-                return result;
-            }
+            if (setting == null || setting.SettingValue == null)
+                return true;
 
-            feedback($"[AutoLogout] Setting 'AutoLogoutAtShiftEnd' NOT FOUND in shiftSettings collection");
-            return false; // Default to false if setting not found
+            string value = setting.SettingValue.Trim().ToLowerInvariant();
+            return !(value == "false" || value == "0" || value == "no" || value == "off");
         }
-        public int AutoLogoutExpiredShifts()
+
+        /// <summary>
+        /// Logs an operator out by rule (shift start, shift end, break) and turns the station's LED red
+        /// once nobody is left logged in there.
+        /// </summary>
+        private void LogoutAtStation(OperatorLoginState opState, string reason)
         {
-            feedback($"[AutoLogout] === Auto-logout check starting at {DateTime.Now:HH:mm:ss} ===");
+            int machineId = opState.MachineID;
+            int subId = opState.SubID;
+            feedback(reason);
+            opState.Logout(DateTime.Now);
 
-            bool autoLogoutEnabled = GetAutoLogoutAtShiftEnd();
-
-            if (!UseShiftManagement || !autoLogoutEnabled)
+            if (OperatorStates.TotalLoggedInByMachineSubID(machineId, subId) == 0)
             {
-                feedback($"[AutoLogout] EXITING EARLY: UseShiftManagement={UseShiftManagement}, autoLogoutEnabled={autoLogoutEnabled}");
-                return 0;
+                foreach (RfIdeasTcpReader reader in TcpReaders)
+                {
+                    if (reader.MachineID == machineId && reader.SubID == subId)
+                    {
+                        reader.RedLED();
+                        reader.IsActiveStation = false;
+                    }
+                }
             }
+        }
 
-            feedback($"[AutoLogout] Checking {OperatorStates.Count} operator login states...");
+        /// <summary>
+        /// Shift start rule: an operator who is logged in without a shift, on a machine whose shift is now
+        /// running, is logged out and has to log in again to join the shift. This is a rule of shift
+        /// logging - it applies whether or not AutoLogoutAtShiftEnd is on. Runs every minute, and whenever
+        /// logins have been restored from the database (service start, logins made by other applications).
+        /// </summary>
+        public int ShiftStartLogoutCheck()
+        {
+            if (!UseShiftManagement)
+                return 0;
+
             int logoutCount = 0;
-
             try
             {
                 foreach (OperatorLoginState opState in OperatorStates)
                 {
-                    if (opState.IsLoggedIn)
+                    // MachineID <= 0: not at a station (e.g. on a break started at a kiosk)
+                    if (!opState.IsLoggedIn || opState.ActiveShiftId.HasValue || opState.MachineID <= 0)
+                        continue;
+
+                    Shift machineShift = GetActiveShift(opState.MachineID);
+                    if (machineShift == null)
+                        continue; // machine not on a shift now - shift rules don't apply
+
+                    LogoutAtStation(opState, $"[ShiftStart] Operator {opState.OperatorID} at Machine {opState.MachineID}, Sub {opState.SubID} logged out - " +
+                                             $"logged in without a shift and shift {machineShift.ShiftName} is running on the machine");
+                    logoutCount++;
+                }
+            }
+            catch (Exception ex)
+            {
+                feedback($"[ShiftStart] ERROR: {ex.Message}");
+                feedback($"[ShiftStart] Stack trace: {ex.StackTrace}");
+            }
+            return logoutCount;
+        }
+
+        /// <summary>
+        /// Rule TM1, shift end: everyone still logged in on a shift that has ended is logged out (at the
+        /// shift's end time, not after Delta+). On unless AutoLogoutAtShiftEnd has been switched off.
+        /// </summary>
+        public int AutoLogoutExpiredShifts()
+        {
+            if (!UseShiftManagement)
+                return 0;
+
+            bool autoLogoutEnabled = GetAutoLogoutAtShiftEnd();
+            if (autoLogoutEnabled != lastAutoLogoutAtShiftEnd)
+            {
+                lastAutoLogoutAtShiftEnd = autoLogoutEnabled;
+                feedback(autoLogoutEnabled
+                    ? "[AutoLogout] Logout at shift end is ON"
+                    : "[AutoLogout] Logout at shift end is OFF (AutoLogoutAtShiftEnd is switched off in tblShiftSettings)");
+            }
+            if (!autoLogoutEnabled)
+                return 0;
+
+            int logoutCount = 0;
+            try
+            {
+                DateTime now = DateTime.Now;
+                foreach (OperatorLoginState opState in OperatorStates)
+                {
+                    if (!opState.IsLoggedIn || !opState.ActiveShiftId.HasValue)
+                        continue;
+
+                    // Get shift details from datalayer (per spec: never store shift times, always query)
+                    Shift loginShift = (Shift)shifts.GetById(opState.ActiveShiftId.Value);
+                    if (loginShift == null)
+                        continue; // shift deleted while the operator was on it - ShiftTransitionCheck deals with it
+
+                    if (IsShiftRunningAt(loginShift, now))
+                        continue;
+
+                    if (opState.MachineID <= 0)
                     {
-                        feedback($"[AutoLogout] Checking Operator {opState.OperatorID}, Machine {opState.MachineID}, Sub {opState.SubID}, ActiveShiftId={opState.ActiveShiftId}");
-
-                        // Check if operator has shift info
-                        if (opState.ActiveShiftId.HasValue)
-                        {
-                            // Get shift details from datalayer (per spec: never store shift times, always query)
-                            Shift loginShift = (Shift)shifts.GetById(opState.ActiveShiftId.Value);
-
-                            if (loginShift != null)
-                            {
-                                DateTime now = DateTime.Now;
-
-                                // Calculate the shift end time based on operator's login date
-                                // Use the operator's login date as the base to handle overnight shifts correctly
-                                DateTime loginDate = opState.LoginTime.Date;
-                                DateTime shiftEndTime = loginDate.Add(loginShift.EndTime);
-
-                                // Handle midnight-crossing shifts (e.g., 22:00-06:00)
-                                if (loginShift.EndTime <= loginShift.StartTime)
-                                {
-                                    // Shift crosses midnight
-                                    shiftEndTime = shiftEndTime.AddDays(1);
-                                }
-
-                                // Determine if shift has ended
-                                bool shiftEnded = false;
-                                if (loginShift.StartTime <= loginShift.EndTime)
-                                {
-                                    // Normal shift (doesn't cross midnight)
-                                    shiftEnded = (now >= shiftEndTime);
-                                }
-                                else
-                                {
-                                    // Midnight-crossing shift
-                                    // Shift has ended if we're past shift end time AND before shift start time
-                                    if (now.TimeOfDay >= loginShift.EndTime && now.TimeOfDay < loginShift.StartTime)
-                                    {
-                                        shiftEnded = true;
-                                    }
-                                }
-
-                                feedback($"[AutoLogout] Operator {opState.OperatorID}, Machine {opState.MachineID}, " +
-                                         $"LoginShift '{loginShift.ShiftName}' (ID={loginShift.ShiftID}), " +
-                                         $"ShiftEnd={loginShift.EndTime}, ShiftEnded={shiftEnded}");
-
-                                // Auto-logout if shift has ended (per spec: at shift end time, NOT after delta+)
-                                if (shiftEnded)
-                                {
-                                    feedback($"[AutoLogout] LOGGING OUT: Operator {opState.OperatorID}, Machine {opState.MachineID}");
-                                    opState.Logout(DateTime.Now);
-                                    logoutCount++;
-
-                                    // Update the LED on the reader
-                                    foreach (RfIdeasTcpReader reader in TcpReaders)
-                                    {
-                                        if (reader.MachineID == opState.MachineID && reader.SubID == opState.SubID)
-                                        {
-                                            reader.RedLED();
-                                            reader.IsActiveStation = false;
-                                        }
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                feedback($"[AutoLogout] Shift ID {opState.ActiveShiftId.Value} NOT FOUND in database for Operator {opState.OperatorID} - clearing orphaned shift info");
-
-                                // Clear orphaned shift references (per spec: handle shift-not-found scenario)
-                                opState.ActiveShiftId = null;
-                            }
-                        }
-                        else
-                        {
-                            // Operator logged in without shift info
-                            // Per spec: ONLY enforce shift management if machine is using shifts
-                            // Check if their machine is SUPPOSED to be using shifts
-                            Shift machineActiveShift = GetActiveShift(opState.MachineID);
-
-                            if (machineActiveShift != null)
-                            {
-                                // Machine IS using shifts but operator has no shift info - orphaned login
-                                // This happens when operator logged in before shift management was enabled
-                                feedback($"[AutoLogout] Operator {opState.OperatorID} logged in without shift info on shift-enabled machine (shift: {machineActiveShift.ShiftName}) - LOGGING OUT (orphaned login)");
-                                opState.Logout(DateTime.Now);
-                                logoutCount++;
-
-                                // Update the LED on the reader
-                                foreach (RfIdeasTcpReader reader in TcpReaders)
-                                {
-                                    if (reader.MachineID == opState.MachineID && reader.SubID == opState.SubID)
-                                    {
-                                        reader.RedLED();
-                                        reader.IsActiveStation = false;
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                // Machine is NOT using shifts - operator correctly has no shift info
-                                // Per spec: shift management rules do NOT apply when machine has no active shift
-                                feedback($"[AutoLogout] Operator {opState.OperatorID} has no shift info - machine {opState.MachineID} not using shifts, skipping");
-                                // Do NOT log out
-                            }
-                        }
+                        // Not at a station (e.g. on a break started at a kiosk): nothing to log out of,
+                        // just release the operator from the ended shift
+                        opState.ActiveShiftId = null;
+                        continue;
                     }
+
+                    LogoutAtStation(opState, $"[AutoLogout] Operator {opState.OperatorID} at Machine {opState.MachineID}, Sub {opState.SubID} logged out - " +
+                                             $"shift {loginShift.ShiftName} ended at {loginShift.EndTime:hh\\:mm}");
+                    logoutCount++;
                 }
             }
             catch (Exception ex)
@@ -903,100 +988,66 @@ namespace TPL.TagReaders
                 feedback($"[AutoLogout] ERROR: {ex.Message}");
                 feedback($"[AutoLogout] Stack trace: {ex.StackTrace}");
             }
-
-            feedback($"[AutoLogout] === Auto-logout check complete: {logoutCount} operators logged out ===");
             return logoutCount;
         }
 
         /// <summary>
-        /// Rule TM2: Shift Transition Check - runs every minute after auto-logout
-        /// Handles transitioning operators between shifts and assigning shifts to operators without shift info
+        /// Rule TM2: Shift Transition Check - runs every minute after the shift-end logout.
+        /// Only has work to do when AutoLogoutAtShiftEnd is off, or when a shift was deleted while operators
+        /// were on it: an operator whose shift has ended (and its Delta+ has passed) or no longer exists moves
+        /// to the shift now running on the machine, or is released from shift rules if there is none.
+        /// Operators without a shift are not given one here - the shift start rule logs them out instead.
         /// </summary>
         public int ShiftTransitionCheck()
         {
             if (!UseShiftManagement)
                 return 0;
 
-            feedback($"[ShiftTransition] === Shift transition check starting at {DateTime.Now:HH:mm:ss} ===");
             int transitionCount = 0;
-
             try
             {
+                DateTime now = DateTime.Now;
                 foreach (OperatorLoginState opState in OperatorStates)
                 {
-                    if (!opState.IsLoggedIn)
-                        continue; // Only process logged-in operators
+                    if (!opState.IsLoggedIn || !opState.ActiveShiftId.HasValue)
+                        continue;
 
-                    if (opState.ActiveShiftId.HasValue)
+                    // Rule TM2.1: Operator has shift info - check if should transition
+                    Shift currentShift = (Shift)shifts.GetById(opState.ActiveShiftId.Value);
+                    string why;
+
+                    if (currentShift == null)
                     {
-                        // Rule TM2.1: Operator has shift info - check if should transition
-                        Shift currentShift = (Shift)shifts.GetById(opState.ActiveShiftId.Value);
+                        why = $"shift ID {opState.ActiveShiftId.Value} no longer exists";
+                    }
+                    else
+                    {
+                        // Still running? Decided from the shift's own times, not the login date: for an
+                        // overnight shift the login date put the end a day late for a login after midnight
+                        if (IsShiftRunningAt(currentShift, now))
+                            continue;
 
-                        if (currentShift == null)
-                        {
-                            // Shift not found - clear and treat as no shift
-                            feedback($"[ShiftTransition] Shift ID {opState.ActiveShiftId.Value} not found for Operator {opState.OperatorID} - clearing");
-                            opState.ActiveShiftId = null;
-                            // Fall through to Rule TM2.2
-                        }
-                        else
-                        {
-                            // Calculate shift end time + DeltaPlus
-                            DateTime loginDate = opState.LoginTime.Date;
-                            DateTime shiftEndTime = loginDate.Add(currentShift.EndTime);
+                        // Ended - the grace period runs from the most recent time the shift ended
+                        DateTime endToday = now.Date + currentShift.EndTime;
+                        DateTime lastEnd = endToday <= now ? endToday : endToday.AddDays(-1);
+                        if (now <= lastEnd.AddMinutes(currentShift.DeltaPlus))
+                            continue; // still in the ended shift's grace period - no action
 
-                            // Handle midnight-crossing shifts
-                            if (currentShift.EndTime <= currentShift.StartTime)
-                            {
-                                shiftEndTime = shiftEndTime.AddDays(1);
-                            }
-
-                            DateTime deltaPlusExpiry = shiftEndTime.AddMinutes(currentShift.DeltaPlus);
-                            DateTime now = DateTime.Now;
-
-                            // Check if still within delta+ period
-                            if (now <= deltaPlusExpiry)
-                            {
-                                // Still in current shift's grace period - no action
-                                continue;
-                            }
-
-                            // Delta+ has expired - determine next action
-                            feedback($"[ShiftTransition] Operator {opState.OperatorID} Delta+ expired at {deltaPlusExpiry:HH:mm:ss}");
-
-                            Shift newShift = GetActiveShift(opState.MachineID);
-
-                            if (newShift != null)
-                            {
-                                // Transition to new shift
-                                opState.ActiveShiftId = newShift.ShiftID;
-                                transitionCount++;
-                                feedback($"[ShiftTransition] Operator {opState.OperatorID} transitioned from shift {currentShift.ShiftID} to shift {newShift.ShiftID} ({newShift.ShiftName})");
-                            }
-                            else
-                            {
-                                // No active shift - clear shift info
-                                opState.ActiveShiftId = null;
-                                transitionCount++;
-                                feedback($"[ShiftTransition] Operator {opState.OperatorID} shift info cleared - no active shift");
-                            }
-                        }
+                        why = $"shift {currentShift.ShiftName} has ended";
                     }
 
-                    // Rule TM2.2: Check if operator without shift info should be assigned a shift
-                    if (!opState.ActiveShiftId.HasValue && opState.IsLoggedIn)
+                    Shift newShift = opState.MachineID > 0 ? GetActiveShift(opState.MachineID) : null;
+                    if (newShift != null)
                     {
-                        Shift activeShift = GetActiveShift(opState.MachineID);
-
-                        if (activeShift != null)
-                        {
-                            // Assign shift to operator
-                            opState.ActiveShiftId = activeShift.ShiftID;
-                            transitionCount++;
-                            feedback($"[ShiftTransition] Operator {opState.OperatorID} assigned to shift {activeShift.ShiftID} ({activeShift.ShiftName}) - shift started while logged in");
-                        }
-                        // No action if no active shift
+                        opState.ActiveShiftId = newShift.ShiftID;
+                        feedback($"[ShiftTransition] Operator {opState.OperatorID} moved to shift {newShift.ShiftID} ({newShift.ShiftName}) - {why}");
                     }
+                    else
+                    {
+                        opState.ActiveShiftId = null;
+                        feedback($"[ShiftTransition] Operator {opState.OperatorID} shift info cleared - {why}, no shift running on the machine");
+                    }
+                    transitionCount++;
                 }
             }
             catch (Exception ex)
@@ -1004,9 +1055,65 @@ namespace TPL.TagReaders
                 feedback($"[ShiftTransition] ERROR: {ex.Message}");
                 feedback($"[ShiftTransition] Stack trace: {ex.StackTrace}");
             }
-
-            feedback($"[ShiftTransition] === Shift transition check complete: {transitionCount} transitions ===");
             return transitionCount;
+        }
+
+        // A break is acted on up to this many minutes after its time, so one isn't missed because the
+        // service was busy or restarting at that moment
+        private const int BreakCatchUpMinutes = 5;
+
+        /// <summary>
+        /// Break rule: at each break start time of a shift, everyone logged in on that shift is logged out -
+        /// permissions make no difference. Logging in again, at the same station or another, is up to the
+        /// operator. A break has no end time.
+        /// Nothing is remembered between checks: an operator is logged out when a break time of their shift
+        /// passed within the last few minutes and they logged in before it. So an operator who has logged
+        /// back in isn't logged out again by the same break, a break isn't missed by a late check or a
+        /// restart, and a shift that crosses midnight needs no special handling.
+        /// </summary>
+        public int BreakLogoutCheck()
+        {
+            if (!UseShiftManagement || shiftBreaks == null || shiftBreaks.Count == 0)
+                return 0;
+
+            int logoutCount = 0;
+            try
+            {
+                DateTime now = DateTime.Now;
+                foreach (OperatorLoginState opState in OperatorStates)
+                {
+                    // MachineID <= 0: not at a station (e.g. on a break started at a kiosk)
+                    if (!opState.IsLoggedIn || !opState.ActiveShiftId.HasValue || opState.MachineID <= 0)
+                        continue;
+
+                    // The most recent time any of the shift's breaks started
+                    int shiftId = opState.ActiveShiftId.Value;
+                    DateTime? lastBreak = null;
+                    foreach (ShiftBreak shiftBreak in shiftBreaks.OfType<ShiftBreak>().Where(b => b.ShiftID == shiftId))
+                    {
+                        DateTime started = now.Date + shiftBreak.BreakTime;
+                        if (started > now)
+                            started = started.AddDays(-1);
+                        if (!lastBreak.HasValue || started > lastBreak.Value)
+                            lastBreak = started;
+                    }
+
+                    if (!lastBreak.HasValue
+                        || (now - lastBreak.Value).TotalMinutes > BreakCatchUpMinutes
+                        || opState.LoginTime >= lastBreak.Value)
+                        continue;
+
+                    LogoutAtStation(opState, $"[Break] Operator {opState.OperatorID} at Machine {opState.MachineID}, Sub {opState.SubID} logged out - " +
+                                             $"break at {lastBreak.Value:HH:mm}");
+                    logoutCount++;
+                }
+            }
+            catch (Exception ex)
+            {
+                feedback($"[Break] ERROR: {ex.Message}");
+                feedback($"[Break] Stack trace: {ex.StackTrace}");
+            }
+            return logoutCount;
         }
 
         /// <summary>
@@ -1030,8 +1137,13 @@ namespace TPL.TagReaders
                 TimeSpan currentTimeOfDay = checkTime.TimeOfDay;
                 int dayInt = (int)currentDay;
 
-                feedback($"[GetActiveShift] Looking for machine_idJensen={machine_idJensen}, day={currentDay}, time={currentTimeOfDay:hh\\:mm\\:ss}");
-                feedback($"[GetActiveShift] Total shift assignments loaded: {shiftMachineAssignments.Count}");
+                // This runs for every card scan and for every logged-in operator each minute, so its
+                // tracing is only written in debug mode (everything sent to feedback() lands in the event log)
+                if (DebugMode)
+                {
+                    debugInfo($"[GetActiveShift] Looking for machine_idJensen={machine_idJensen}, day={currentDay}, time={currentTimeOfDay:hh\\:mm\\:ss}");
+                    debugInfo($"[GetActiveShift] Total shift assignments loaded: {shiftMachineAssignments.Count}");
+                }
 
                 // Get all shift assignments for this machine on this day of week
                 var assignments = shiftMachineAssignments
@@ -1041,21 +1153,25 @@ namespace TPL.TagReaders
                              && a.IsActive)
                     .ToList();
 
-                feedback($"[GetActiveShift] Found {assignments.Count} assignments matching machine_idJensen={machine_idJensen}, day={dayInt}");
+                if (DebugMode)
+                    debugInfo($"[GetActiveShift] Found {assignments.Count} assignments matching machine_idJensen={machine_idJensen}, day={dayInt}");
 
                 if (assignments.Count == 0)
                 {
-                    // Debug: Show what we have for this machine
-                    var allForMachine = shiftMachineAssignments
-                        .OfType<ShiftMachineAssignment>()
-                        .Where(a => a.MachineIdJensen == machine_idJensen)
-                        .ToList();
-                    feedback($"[GetActiveShift] Total assignments for machine_idJensen={machine_idJensen}: {allForMachine.Count}");
-
-                    if (allForMachine.Count > 0)
+                    if (DebugMode)
                     {
-                        var sample = allForMachine.First();
-                        feedback($"[GetActiveShift] Sample assignment: ShiftID={sample.ShiftID}, MachineRecNum={sample.MachineRecNum}, MachineIdJensen={sample.MachineIdJensen}, DayOfWeek={sample.DayOfWeek}, IsActive={sample.IsActive}");
+                        // Debug: Show what we have for this machine
+                        var allForMachine = shiftMachineAssignments
+                            .OfType<ShiftMachineAssignment>()
+                            .Where(a => a.MachineIdJensen == machine_idJensen)
+                            .ToList();
+                        debugInfo($"[GetActiveShift] Total assignments for machine_idJensen={machine_idJensen}: {allForMachine.Count}");
+
+                        if (allForMachine.Count > 0)
+                        {
+                            var sample = allForMachine.First();
+                            debugInfo($"[GetActiveShift] Sample assignment: ShiftID={sample.ShiftID}, MachineRecNum={sample.MachineRecNum}, MachineIdJensen={sample.MachineIdJensen}, DayOfWeek={sample.DayOfWeek}, IsActive={sample.IsActive}");
+                        }
                     }
 
                     return null;
@@ -1093,6 +1209,17 @@ namespace TPL.TagReaders
         }
 
         /// <summary>
+        /// True if the time of day falls inside the shift's start-end window (handles shifts that cross midnight)
+        /// </summary>
+        private static bool IsShiftRunningAt(Shift shift, DateTime time)
+        {
+            TimeSpan timeOfDay = time.TimeOfDay;
+            if (shift.StartTime <= shift.EndTime)
+                return timeOfDay >= shift.StartTime && timeOfDay < shift.EndTime;
+            return timeOfDay >= shift.StartTime || timeOfDay < shift.EndTime;
+        }
+
+        /// <summary>
         /// Checks if current time is within the combined delta period (DeltaMinus before OR DeltaPlus after shift end)
         /// Per spec: Delta- is (ShiftEnd - DeltaMinus) to ShiftEnd
         ///           Delta+ is ShiftEnd to (ShiftEnd + DeltaPlus)
@@ -1107,87 +1234,17 @@ namespace TPL.TagReaders
 
             try
             {
-                TimeSpan currentTimeOfDay = currentTime.TimeOfDay;
-                TimeSpan shiftStartTime = shift.StartTime;
-                TimeSpan shiftEndTime = shift.EndTime;
+                // Work with full dates and times so midnight needs no special handling: the next time the
+                // shift ends, and the last time it ended. (The time-of-day version treated everything from
+                // an overnight shift's end time up to midnight as inside Delta-, so nobody on a night shift
+                // was held before midnight.)
+                DateTime endToday = currentTime.Date + shift.EndTime;
+                DateTime nextEnd = endToday > currentTime ? endToday : endToday.AddDays(1);
+                DateTime lastEnd = nextEnd.AddDays(-1);
 
-                // Calculate delta boundaries using SEPARATE DeltaMinus and DeltaPlus values
-                TimeSpan deltaMinusStart = shiftEndTime.Subtract(TimeSpan.FromMinutes(shift.DeltaMinus));
-                TimeSpan deltaPlusEnd = shiftEndTime.Add(TimeSpan.FromMinutes(shift.DeltaPlus));
-
-                if (shiftStartTime <= shiftEndTime)
-                {
-                    // Normal shift (doesn't cross midnight) e.g., 06:00 - 14:00
-                    // Delta- period: (14:00 - 15min) to 14:00 = 13:45 to 14:00
-                    // Delta+ period: 14:00 to (14:00 + 10min) = 14:00 to 14:10
-
-                    // Check Delta- (before shift end)
-                    if (currentTimeOfDay >= deltaMinusStart && currentTimeOfDay < shiftEndTime)
-                    {
-                        return true; // Within Delta- period
-                    }
-
-                    // Check Delta+ (after shift end)
-                    if (currentTimeOfDay >= shiftEndTime && currentTimeOfDay <= deltaPlusEnd)
-                    {
-                        return true; // Within Delta+ period
-                    }
-                }
-                else
-                {
-                    // Midnight-crossing shift e.g., 22:00 - 06:00
-                    // Delta- period: (06:00 - 15min) to 06:00 = 05:45 to 06:00
-                    // Delta+ period: 06:00 to (06:00 + 10min) = 06:00 to 06:15
-
-                    // Handle negative time (before midnight)
-                    if (deltaMinusStart < TimeSpan.Zero)
-                    {
-                        deltaMinusStart = deltaMinusStart.Add(TimeSpan.FromHours(24));
-                    }
-
-                    // Check if we're in the Delta- period (before shift end)
-                    if (currentTimeOfDay >= deltaMinusStart || currentTimeOfDay < shiftEndTime)
-                    {
-                        // We're potentially in range, but need to verify we're actually in Delta-
-                        if (currentTimeOfDay >= deltaMinusStart && currentTimeOfDay < TimeSpan.FromHours(24))
-                        {
-                            return true; // In Delta- on same day as shift start
-                        }
-                        if (currentTimeOfDay >= TimeSpan.Zero && currentTimeOfDay < shiftEndTime)
-                        {
-                            // We're after midnight - check if within Delta-
-                            if (currentTimeOfDay >= deltaMinusStart || deltaMinusStart > shiftEndTime)
-                            {
-                                return true; // In Delta- after midnight
-                            }
-                        }
-                    }
-
-                    // Check Delta+ (after shift end, handling potential overflow past midnight)
-                    if (deltaPlusEnd >= TimeSpan.FromHours(24))
-                    {
-                        // Delta+ wraps past midnight
-                        TimeSpan deltaPlusEndWrapped = deltaPlusEnd.Subtract(TimeSpan.FromHours(24));
-                        if (currentTimeOfDay >= shiftEndTime && currentTimeOfDay < TimeSpan.FromHours(24))
-                        {
-                            return true; // In Delta+ before midnight wrap
-                        }
-                        if (currentTimeOfDay >= TimeSpan.Zero && currentTimeOfDay <= deltaPlusEndWrapped)
-                        {
-                            return true; // In Delta+ after midnight wrap
-                        }
-                    }
-                    else
-                    {
-                        // Delta+ doesn't wrap past midnight
-                        if (currentTimeOfDay >= shiftEndTime && currentTimeOfDay <= deltaPlusEnd)
-                        {
-                            return true; // Within Delta+
-                        }
-                    }
-                }
-
-                return false; // Outside both delta periods
+                // Delta-: (next end - DeltaMinus) up to the end. Delta+: the last end up to (last end + DeltaPlus).
+                return currentTime >= nextEnd.AddMinutes(-shift.DeltaMinus)
+                    || currentTime <= lastEnd.AddMinutes(shift.DeltaPlus);
             }
             catch (Exception ex)
             {
@@ -1349,23 +1406,46 @@ namespace TPL.TagReaders
             return false;
         }
 
+        /// <summary>
+        /// Legacy (pre-shift) login, used when shift management is disabled or the machine has no active shift.
+        /// Restores the original non-shift behaviour: on a single-login station the current occupant is
+        /// logged out, then the operator is logged in if the station has capacity.
+        /// </summary>
+        /// <returns>True if the operator was logged in</returns>
+        private bool LegacyLogin(OperatorLoginState opState, RfIdeasTcpReader tcpReader, int machineid, int subid)
+        {
+            if (tcpReader.MaxLogins == 1)  //if !allow multi then logout
+            {
+                OperatorLoginState otherOperator = (OperatorLoginState)OperatorStates.GetLoggedInByMachineSubID(machineid, subid);
+                if (otherOperator != null) //another operator is logged in here!
+                {
+                    otherOperator.Logout(DateTime.Now); //log them out
+                }
+            }
+            if (OperatorStates.TotalLoggedInByMachineSubID(machineid, subid) < tcpReader.MaxLogins)
+            {
+                opState.Login(machineid, subid, DateTime.Now); //login this user, no shift info
+                tcpReader.GreenLED();
+                tcpReader.IsActiveStation = true;
+                return true;
+            }
+            feedback($"[ShiftManagement] Legacy login refused - station full: Machine {machineid}, Sub {subid}, MaxLogins {tcpReader.MaxLogins}");
+            return false;
+        }
+
         public void ReloadData(bool useCache)
         {
-            try
-            {
-                getShiftData(useCache);
-            }
-            catch (Exception ex)
-            {
-                debugInfo(this.GetType().Name + " " + MethodInfo.GetCurrentMethod() + ex.Message);
-            }
+            // Shift data isn't reloaded on every tick - RunShiftChecks refreshes it once a minute. On a full
+            // reload (service start) it has to be in place before the logins are restored below.
+            if (!useCache)
+                RefreshShiftData();
             try
             {
                 getOperatorsData(useCache);
             }
             catch (Exception ex)
             {
-                debugInfo(this.GetType().Name + " " + MethodInfo.GetCurrentMethod() + ex.Message);
+                reloadError("operators", ex);
             }
             try
             {
@@ -1373,7 +1453,7 @@ namespace TPL.TagReaders
             }
             catch (Exception ex)
             {
-                debugInfo(this.GetType().Name + " " + MethodInfo.GetCurrentMethod() + ex.Message);
+                reloadError("machine stations", ex);
             }
             try
             {
@@ -1381,7 +1461,7 @@ namespace TPL.TagReaders
             }
             catch (Exception ex)
             {
-                debugInfo(this.GetType().Name + " " + MethodInfo.GetCurrentMethod() + ex.Message);
+                reloadError("operator log", ex);
             }
             try
             {
@@ -1389,7 +1469,7 @@ namespace TPL.TagReaders
             }
             catch (Exception ex)
             {
-                debugInfo(this.GetType().Name + " " + MethodInfo.GetCurrentMethod() + ex.Message);
+                reloadError("restoring logins", ex);
             }
             try
             {
@@ -1397,7 +1477,29 @@ namespace TPL.TagReaders
             }
             catch (Exception ex)
             {
-                debugInfo(this.GetType().Name + " " + MethodInfo.GetCurrentMethod() + ex.Message);
+                reloadError("tags", ex);
+            }
+        }
+
+        // step -> (last message, when reported)
+        private Dictionary<string, KeyValuePair<string, DateTime>> lastReloadErrors = new Dictionary<string, KeyValuePair<string, DateTime>>();
+
+        /// <summary>
+        /// Reports a ReloadData failure. ReloadData runs every 100 ms and every feedback line goes to the
+        /// event log, so each step's error is only reported when its message changes or once a minute.
+        /// </summary>
+        private void reloadError(string step, Exception ex)
+        {
+            reloadError(step, ex.Message);
+        }
+
+        private void reloadError(string step, string message)
+        {
+            KeyValuePair<string, DateTime> last;
+            if (!lastReloadErrors.TryGetValue(step, out last) || last.Key != message || (DateTime.Now - last.Value).TotalMinutes >= 1)
+            {
+                lastReloadErrors[step] = new KeyValuePair<string, DateTime>(message, DateTime.Now);
+                feedback($"[Reload] Loading {step} failed: {message}");
             }
         }
 
@@ -1647,9 +1749,9 @@ namespace TPL.TagReaders
                                     // PREREQUISITE CHECK per spec
                                     if (!UseShiftManagement || !machineHasActiveShift)
                                     {
-                                        feedback($"[ShiftManagement] Shift management disabled or no active shift - using legacy logic (out of scope)");
-                                        // Legacy logic would go here - for now, attempt login
+                                        feedback($"[ShiftManagement] Shift management disabled or no active shift - using legacy logic");
                                         canLogin = true;
+                                        LegacyLogin(opState, tcpReader, machine_idJensen, subid);
                                     }
                                     else
                                     {
@@ -1801,8 +1903,8 @@ namespace TPL.TagReaders
                                     if (!UseShiftManagement || !machineHasActiveShift)
                                     {
                                         // ShiftManagement SCENARIO C
-                                        feedback($"[ShiftManagement] Shift management disabled or no active shift - using legacy logic (out of scope)");
-                                        // Legacy logic would allow station movement - perform remote logout
+                                        feedback($"[ShiftManagement] Shift management disabled or no active shift - using legacy logic");
+                                        // Legacy station movement - logout from current station, then login here
                                         opState.Logout(DateTime.Now);
                                         foreach (RfIdeasTcpReader reader in TcpReaders)
                                         {
@@ -1813,6 +1915,7 @@ namespace TPL.TagReaders
                                             }
                                         }
                                         canLogin = true;
+                                        LegacyLogin(opState, tcpReader, machine_idJensen, subid);
                                     }
                                     else
                                     {
@@ -1903,8 +2006,8 @@ namespace TPL.TagReaders
                                     if (!UseShiftManagement || !machineHasActiveShift)
                                     {
                                         // ShiftManagement SCENARIO D
-                                        feedback($"[ShiftManagement] Shift management disabled or no active shift - using legacy logic (out of scope)");
-                                        // Legacy logic would allow remote logout - perform it
+                                        feedback($"[ShiftManagement] Shift management disabled or no active shift - using legacy logic");
+                                        // Legacy remote logout - logout from other machine, then login here
                                         opState.Logout(DateTime.Now);
                                         foreach (RfIdeasTcpReader reader in TcpReaders)
                                         {
@@ -1915,6 +2018,7 @@ namespace TPL.TagReaders
                                             }
                                         }
                                         canLogin = true;
+                                        LegacyLogin(opState, tcpReader, machine_idJensen, subid);
                                     }
                                     else
                                     {
@@ -2094,11 +2198,14 @@ namespace TPL.TagReaders
 
         public void Stop()
         {
+            // Signal every reader, then wait once for their loops to finish - waiting per reader made a
+            // stop take half a second per reader
             foreach (RfIdeasTcpReader tcpReader in TcpReaders)
             {
-                tcpReader.Disconnect();
+                tcpReader.Disconnect(false);
                 tcpReader.CurrentLED = "GREY";
             }
+            Thread.Sleep(500);
             // Clear shared memory to signal service stopped (invalidates timestamp)
             try
             {
@@ -2858,10 +2965,13 @@ namespace TPL.TagReaders
             if (allowFeedback) FeedbackQ.Enqueue($"[{DateTime.Now:HH:mm:ss.fff}] [{ipAddress}:{port}] Starting persistent connection and LED monitor");
 
             // Start persistent connection task
-            commsTask = Task.Factory.StartNew(() => PersistentCommsLoop());
+            // Both loops run for the life of the reader, so they get their own threads (LongRunning).
+            // On the thread pool, two blocking loops per reader starved the pool and readers came online
+            // one by one over a minute or more after a start.
+            commsTask = Task.Factory.StartNew(() => PersistentCommsLoop(), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
             // Start LED status monitor task
-            ledMonitorTask = Task.Factory.StartNew(() => LEDStatusMonitor());
+            ledMonitorTask = Task.Factory.StartNew(() => LEDStatusMonitor(), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
             return true;
         }
@@ -2984,7 +3094,8 @@ namespace TPL.TagReaders
 
         // OLD MonitorCommsProcess removed - replaced by PersistentCommsLoop and LEDStatusMonitor
 
-        public void Disconnect()
+        /// <param name="wait">false when the caller disconnects several readers and waits once for all of them</param>
+        public void Disconnect(bool wait = true)
         {
             try
             {
@@ -2998,7 +3109,8 @@ namespace TPL.TagReaders
                 }
 
                 // Wait for tasks to finish gracefully
-                Thread.Sleep(500);
+                if (wait)
+                    Thread.Sleep(500);
             }
             catch (Exception ex)
             {
@@ -3853,6 +3965,9 @@ namespace TPL.TagReaders
             LogoutTime = logout;
             LogInOut(0);
             IsLoggedIn = false;
+            // A shift belongs to a login. Without this, an operator logged out here and then logged in by
+            // another application would still be treated as on the old shift (held to it, logged out by its breaks).
+            ActiveShiftId = null;
         }
 
         private JGLogDataRec createLogDataRecord(DateTime logtime, int state)

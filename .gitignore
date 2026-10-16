@@ -164,6 +164,8 @@ artifacts/
 *.dll
 *.pdb
 *.exe
+# DynamicDataLayer references this checked-in copy (Newtonsoft.Json 13.0.4, net40) - without it a fresh clone can't build
+!DotNet4/Libraries/DynamicDataLayer/DynamicDataLayer/External Libraries/Newtonsoft.Json.dll
 
 # VS / Rider / tooling
 .vs/

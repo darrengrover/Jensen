@@ -1,13 +1,26 @@
 -- =============================================
 -- Setup 10-Minute Shifts for Fast Testing
 -- =============================================
--- Creates 96 ten-minute shifts from 06:00 to 22:00
--- All shifts have DeltaMinus=1, DeltaPlus=1 (1 minute grace period)
+-- !! DEV/TEST ONLY - DELETES ALL SHIFTS AND ASSIGNMENTS. NEVER RUN ON A CUSTOMER SYSTEM. !!
+-- Stops before changing anything unless test machines 2123 and 2125 exist in JEGR_DB.
+--
+-- Creates ten-minute shifts from 06:00 to 22:00 with a 5-minute gap after each one
+-- (06:00-06:10, 06:15-06:25, ...), so the no-shift (legacy) path is exercised every cycle.
+-- All shifts have DeltaMinus=0, DeltaPlus=0 (no grace period - the Shift Editor no longer shows these)
+-- Each shift has one break, 5 minutes after its start (everyone on the shift is logged out then)
 -- Assigns machines 2123 and 2125 to all shifts
--- This allows for rapid testing without waiting hours
+-- Test legacy behaviour on a reader attached to any other (unassigned) machine as well.
 -- =============================================
 
 USE JEGR_Utils;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM JEGR_DB.dbo.tblMachines WHERE IdJensen = 2123)
+   OR NOT EXISTS (SELECT 1 FROM JEGR_DB.dbo.tblMachines WHERE IdJensen = 2125)
+BEGIN
+    RAISERROR('Test machines 2123/2125 not found - this is not the test system. Script stopped, nothing changed.', 16, 1);
+    SET NOEXEC ON;
+END
 GO
 
 -- =============================================
@@ -18,9 +31,10 @@ DELETE FROM tblShiftMachineAssignments;
 GO
 
 -- =============================================
--- Step 2: Delete all existing shifts
+-- Step 2: Delete all existing shifts (and their break times)
 -- =============================================
-PRINT 'Deleting all shifts...';
+PRINT 'Deleting all shifts and break times...';
+DELETE FROM tblShiftBreaks;
 DELETE FROM tblShifts;
 GO
 
@@ -40,6 +54,7 @@ DECLARE @StartHour INT = 6;
 DECLARE @EndHour INT = 22;
 DECLARE @StartMinute INT = 0;
 DECLARE @ShiftDuration INT = 10; -- 10 minutes
+DECLARE @GapMinutes INT = 5;     -- no-shift gap after each shift (legacy logic applies)
 
 DECLARE @CurrentTime TIME;
 DECLARE @EndTime TIME;
@@ -61,11 +76,11 @@ BEGIN
 
     -- Insert shift
     INSERT INTO tblShifts (ShiftID, ShiftName, StartTime, EndTime, DeltaMinus, DeltaPlus, IsActive, CreatedDate, ModifiedDate)
-    VALUES (@ShiftID, @ShiftName, @CurrentTime, @EndTime, 1, 1, 1, GETDATE(), GETDATE());
+    VALUES (@ShiftID, @ShiftName, @CurrentTime, @EndTime, 0, 0, 1, GETDATE(), GETDATE());
 
     -- Move to next shift
     SET @ShiftID = @ShiftID + 1;
-    SET @StartMinute = @StartMinute + @ShiftDuration;
+    SET @StartMinute = @StartMinute + @ShiftDuration + @GapMinutes;
 
     -- Handle hour rollover
     IF @StartMinute >= 60
@@ -81,6 +96,14 @@ GO
 DECLARE @ShiftCount INT;
 SELECT @ShiftCount = COUNT(*) FROM tblShifts;
 PRINT 'Created ' + CAST(@ShiftCount AS VARCHAR(10)) + ' shifts successfully.';
+GO
+
+-- =============================================
+-- Step 3b: One break per shift, 5 minutes after its start
+-- =============================================
+PRINT 'Adding a break 5 minutes into each shift...';
+INSERT INTO tblShiftBreaks (ShiftID, BreakTime)
+SELECT ShiftID, DATEADD(MINUTE, 5, StartTime) FROM tblShifts;
 GO
 
 -- =============================================
@@ -221,11 +244,17 @@ ORDER BY m.IdJensen, sma.DayOfWeek, s.ShiftID;
 
 PRINT '';
 PRINT '=============================================';
-PRINT 'NOTE: With 10-minute shifts, you can test:';
-PRINT '  - Auto-logout: Wait 10 minutes for shift to end';
-PRINT '  - Shift transitions: Wait 11-12 minutes for delta+ to expire';
-PRINT '  - Multiple shift cycles: Test entire day in ~3 hours';
+PRINT 'NOTE: With 10-minute shifts and 5-minute gaps, you can test:';
+PRINT '  - Held to the shift: scanning out during a shift is refused (orange)';
+PRINT '  - Break: 5 minutes into each shift everyone on it is logged out; log in again';
+PRINT '  - Shift end: after 10 minutes everyone on the shift is logged out';
+PRINT '  - Legacy login during the gap after each shift (e.g. 06:10-06:15)';
+PRINT '  - Shift start: a login made in the gap is logged out when the next shift starts';
+PRINT '  - Multiple shift cycles: Test entire day in ~4 hours';
 PRINT '=============================================';
 PRINT 'Shift setup completed successfully!';
 PRINT '=============================================';
+GO
+
+SET NOEXEC OFF;
 GO

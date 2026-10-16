@@ -80,8 +80,8 @@ namespace CentralLoginService.Properties {
         [global::System.Configuration.ApplicationScopedSettingAttribute()]
         [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
         [global::System.Configuration.SpecialSettingAttribute(global::System.Configuration.SpecialSetting.ConnectionString)]
-        [global::System.Configuration.DefaultSettingValueAttribute("Data Source=SWC20231112;Initial Catalog=JEGR_DB;Persist Security Info=True;User I" +
-            "D=sa;Password=Jen&excellent")]
+        [global::System.Configuration.DefaultSettingValueAttribute("Data Source=SET_SQL_SERVER;Initial Catalog=JEGR_DB;Persist Security Info=True;Use" +
+            "r ID=SET_SQL_LOGIN;Password=SET_SQL_PASSWORD")]
         public string JEGRConnection {
             get {
                 return ((string)(this["JEGRConnection"]));

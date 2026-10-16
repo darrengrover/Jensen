@@ -1,7 +1,11 @@
 ﻿<Window x:Class="CentralOperatorShiftEditor.ShiftEditorWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:CentralOperatorShiftEditor"
         Title="Shift Management Editor" Height="700" Width="1200" Closing="Window_Closing">
+    <Window.Resources>
+        <local:TimeOfDayConverter x:Key="TimeOfDayConverter"/>
+    </Window.Resources>
     <DockPanel>
         <!-- Status Bar at bottom -->
         <StatusBar DockPanel.Dock="Bottom" Height="25">
@@ -86,80 +90,6 @@
                                     </DataGridTemplateColumn.CellEditingTemplate>
                                 </DataGridTemplateColumn>
 
-                                <!-- Delta Minus with Spinner Control -->
-                                <DataGridTemplateColumn Header="Delta - (min)" Width="120">
-                                    <DataGridTemplateColumn.CellTemplate>
-                                        <DataTemplate>
-                                            <TextBlock Text="{Binding DeltaMinus}" VerticalAlignment="Center" HorizontalAlignment="Center"/>
-                                        </DataTemplate>
-                                    </DataGridTemplateColumn.CellTemplate>
-                                    <DataGridTemplateColumn.CellEditingTemplate>
-                                        <DataTemplate>
-                                            <Grid>
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*"/>
-                                                    <ColumnDefinition Width="Auto"/>
-                                                </Grid.ColumnDefinitions>
-                                                <TextBox Grid.Column="0" 
-                                             Text="{Binding DeltaMinus, UpdateSourceTrigger=PropertyChanged}"
-                                             PreviewTextInput="NumberValidationTextBox"
-                                             VerticalAlignment="Center"/>
-                                                <StackPanel Grid.Column="1" Orientation="Vertical" Width="18">
-                                                    <Button Content="▲" 
-                                                Height="14" 
-                                                Padding="0" 
-                                                FontSize="8"
-                                                Click="BtnIncrementDeltaMinus_Click"
-                                                ToolTip="Increase by 5"/>
-                                                    <Button Content="▼" 
-                                                Height="14" 
-                                                Padding="0" 
-                                                FontSize="8"
-                                                Click="BtnDecrementDeltaMinus_Click"
-                                                ToolTip="Decrease by 5"/>
-                                                </StackPanel>
-                                            </Grid>
-                                        </DataTemplate>
-                                    </DataGridTemplateColumn.CellEditingTemplate>
-                                </DataGridTemplateColumn>
-
-                                <!-- Delta Plus with Spinner Control -->
-                                <DataGridTemplateColumn Header="Delta + (min)" Width="120">
-                                    <DataGridTemplateColumn.CellTemplate>
-                                        <DataTemplate>
-                                            <TextBlock Text="{Binding DeltaPlus}" VerticalAlignment="Center" HorizontalAlignment="Center"/>
-                                        </DataTemplate>
-                                    </DataGridTemplateColumn.CellTemplate>
-                                    <DataGridTemplateColumn.CellEditingTemplate>
-                                        <DataTemplate>
-                                            <Grid>
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*"/>
-                                                    <ColumnDefinition Width="Auto"/>
-                                                </Grid.ColumnDefinitions>
-                                                <TextBox Grid.Column="0" 
-                                             Text="{Binding DeltaPlus, UpdateSourceTrigger=PropertyChanged}"
-                                             PreviewTextInput="NumberValidationTextBox"
-                                             VerticalAlignment="Center"/>
-                                                <StackPanel Grid.Column="1" Orientation="Vertical" Width="18">
-                                                    <Button Content="▲" 
-                                                Height="14" 
-                                                Padding="0" 
-                                                FontSize="8"
-                                                Click="BtnIncrementDeltaPlus_Click"
-                                                ToolTip="Increase"/>
-                                                    <Button Content="▼" 
-                                                Height="14" 
-                                                Padding="0" 
-                                                FontSize="8"
-                                                Click="BtnDecrementDeltaPlus_Click"
-                                                ToolTip="Decrease"/>
-                                                </StackPanel>
-                                            </Grid>
-                                        </DataTemplate>
-                                    </DataGridTemplateColumn.CellEditingTemplate>
-                                </DataGridTemplateColumn>
-
                                 <DataGridCheckBoxColumn Header="Active" Binding="{Binding IsActive}" Width="70"/>
                             </DataGrid.Columns>
                         </DataGrid>
@@ -172,8 +102,10 @@
                       Background="LightGray"
                       ShowsPreview="True"/>
 
-                    <!-- BOTTOM SECTION: Machine Assignments for Selected Shift -->
-                    <DockPanel Grid.Row="2">
+                    <!-- BOTTOM SECTION: Machine Assignments and Break Times for Selected Shift -->
+                    <TabControl Grid.Row="2">
+                    <TabItem Header="Machines">
+                    <DockPanel>
                         <ToolBarTray DockPanel.Dock="Top">
                             <ToolBar>
                                 <Label Content="Machines in Selected Shift:" FontWeight="Bold" VerticalAlignment="Center"/>
@@ -208,31 +140,57 @@
                             </DataGrid.Columns>
                         </DataGrid>
                     </DockPanel>
+                    </TabItem>
+
+                    <!-- Break start times for selected shift -->
+                    <TabItem Header="Breaks">
+                    <DockPanel>
+                        <ToolBarTray DockPanel.Dock="Top">
+                            <ToolBar>
+                                <Label Content="Break Start Times in Selected Shift:" FontWeight="Bold" VerticalAlignment="Center"/>
+                                <Separator/>
+                                <Button Content="Add Break" Click="BtnAddBreak_Click" ToolTip="Add a break start time to this shift"/>
+                                <Button Content="Remove Selected" Click="BtnRemoveBreak_Click" ToolTip="Remove selected break times (saved with Save Breaks)"/>
+                                <Separator/>
+                                <Button Content="Save Breaks" Click="BtnSaveBreaks_Click"/>
+                                <Button Content="Refresh" Click="BtnRefreshBreaks_Click"/>
+                                <Separator/>
+                                <TextBlock x:Name="txtShiftBreakCount"
+                               Text="0 breaks"
+                               VerticalAlignment="Center"
+                               Margin="10,0,0,0"
+                               Foreground="Gray"/>
+                            </ToolBar>
+                        </ToolBarTray>
+
+                        <TextBlock DockPanel.Dock="Top"
+                               Margin="8,6,8,6"
+                               TextWrapping="Wrap"
+                               Foreground="Gray"
+                               Text="At each break start time, everyone logged in on this shift is logged out. Operators log in again when they return, at the same station or a different one. Changes here take effect about a minute after Save Breaks."/>
+
+                        <!-- Break times grid for selected shift -->
+                        <DataGrid x:Name="dgShiftBreaks"
+                      AutoGenerateColumns="False"
+                      CanUserAddRows="False"
+                      CanUserDeleteRows="False"
+                      SelectionMode="Extended">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="Break Start Time"
+                                                Binding="{Binding BreakTime, Converter={StaticResource TimeOfDayConverter}}"
+                                                Width="150">
+                                    <DataGridTextColumn.EditingElementStyle>
+                                        <Style TargetType="TextBox">
+                                            <Setter Property="ToolTip" Value="Format: HH:mm (e.g., 10:00)"/>
+                                        </Style>
+                                    </DataGridTextColumn.EditingElementStyle>
+                                </DataGridTextColumn>
+                            </DataGrid.Columns>
+                        </DataGrid>
+                    </DockPanel>
+                    </TabItem>
+                    </TabControl>
                 </Grid>
-            </TabItem>
-
-            <!-- Shift Settings Tab -->
-            <TabItem Header="Shift Settings">
-                <DockPanel>
-                    <ToolBarTray DockPanel.Dock="Top">
-                        <ToolBar>
-                            <Button Content="Save" Click="BtnSaveShiftSettings_Click"/>
-                            <Button Content="Refresh" Click="BtnRefreshShiftSettings_Click"/>
-                        </ToolBar>
-                    </ToolBarTray>
-
-                    <DataGrid x:Name="dgShiftSettings" 
-                          AutoGenerateColumns="False"
-                          CanUserAddRows="False"
-                          SelectionMode="Single">
-                        <DataGrid.Columns>
-                            <DataGridTextColumn Header="Setting ID" Binding="{Binding SettingID}" IsReadOnly="True" Width="80"/>
-                            <DataGridTextColumn Header="Setting Name" Binding="{Binding SettingName}" IsReadOnly="True" Width="200"/>
-                            <DataGridTextColumn Header="Value" Binding="{Binding SettingValue}" Width="200"/>
-                            <DataGridTextColumn Header="Description" Binding="{Binding Detail}" Width="400"/>
-                        </DataGrid.Columns>
-                    </DataGrid>
-                </DockPanel>
             </TabItem>
 
             <!-- Operator Settings Tab -->

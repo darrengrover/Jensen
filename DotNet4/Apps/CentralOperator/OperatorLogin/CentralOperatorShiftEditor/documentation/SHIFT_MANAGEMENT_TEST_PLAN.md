@@ -1,34 +1,63 @@
 # REVISED SHIFT MANAGEMENT TEST PLAN (1-HOUR + OVERNIGHT)
 
-**Version:** 2.0
-**Last Updated:** 2025-10-27
+**Version:** 3.0
+**Last Updated:** 2026-10-09
 **Purpose:** Complete test coverage for all shift management rules - optimized for 1-hour daytime testing + overnight midnight-crossing tests
+
+**v3.0 changes (rules agreed 1 October 2026 - service 1.3.0, Shift Editor 1.0.2):**
+- Logout at shift end is on unless switched off by SQL; the setting and the Delta values are no longer
+  in the Shift Editor. Tests that need Delta or the setting off now set them **by SQL** (see Prerequisites).
+- New shift start rule: an operator logged in without a shift is logged out when a shift starts on
+  the machine, whatever the setting. TM1.6, TM2.3, SS1.3 and LP.7 changed accordingly; the old
+  "assign the shift and stay logged in" behaviour is gone.
+- New **Part D**: break times, the default setting, and what the Shift Editor shows.
+- Shift Editor changes reach the service within about a minute - no restart between tests.
+- Log messages updated to the current wording. Routine once-a-minute lines are no longer logged: a
+  check that does nothing writes nothing.
+
+**Part C (legacy parity) must pass before any site install:** wherever shift rules don't apply, the
+service must behave exactly like the non-shift service.
 
 ---
 
 ## OVERVIEW
 
-This test plan is divided into two parts:
+This test plan is divided into four parts:
 1. **PART A: Daytime 1-Hour Test** - All core functionality tests (Sections 1-8)
 2. **PART B: Overnight Midnight-Crossing Tests** - 3 tests spanning midnight (5 min setup + 15 min verification)
+3. **PART C: Legacy Parity Tests** - behaviour where shift rules don't apply (~15 minutes)
+4. **PART D: Breaks, Defaults and the Shift Editor** - break times, logout at shift end by default, hidden settings (~30 minutes)
 
 ---
 
 ## TEST ENVIRONMENT SETUP
 
 ### Prerequisites
-1. **UseShiftManagement** = true (in database settings)
+1. **UseShiftManagement** = true (in the service's `CentralLoginService.exe.config` - set by the Shift installer; it is not a database setting)
 2. **Test Shifts Configured**:
    - **DAYTIME TESTS:**
      - Shift A: 10:00-10:20, DeltaMinus=2 min, DeltaPlus=2 min
      - Shift B: 10:20-10:40, DeltaMinus=2 min, DeltaPlus=2 min
    - **OVERNIGHT TESTS:**
      - Shift C: 16:00-10:00 (next day), DeltaMinus=15 min, DeltaPlus=10 min
+   - **Delta is set by SQL** - the Shift Editor creates shifts with 0 and doesn't show the values. After
+     creating the shifts in the editor:
+     `UPDATE JEGR_Utils.dbo.tblShifts SET DeltaMinus = 2, DeltaPlus = 2 WHERE ShiftName IN ('Shift A', 'Shift B')`
+     (and 15 / 10 for Shift C). Parts A and B test the delta rules, which the service still applies to
+     stored values; Part D tests the normal case, delta 0.
+   - **No break times** on Shifts A, B and C (Part D uses its own shifts)
+   - **`AutoLogoutAtShiftEnd` is set by SQL** where a test says true or false - it is not in the Shift Editor:
+     `UPDATE JEGR_Utils.dbo.tblShiftSettings SET SettingValue = 'False' WHERE SettingName = 'AutoLogoutAtShiftEnd'`
+     (`'True'` to switch it back on). The service picks the change up within a minute and logs
+     "[AutoLogout] Logout at shift end is ON" or "... is OFF"
 3. **Test Machines**:
    - Machine 100: Assigned to Shift A/B (daytime), Shift C (overnight)
    - Machine 100, Station 1: MaxLogins = 1
    - Machine 100, Station 2: MaxLogins = 3 (multi-operator station)
    - Machine 200: Assigned to Shift A/B (daytime)
+   - Machine 200, Station 1: MaxLogins = 1
+   - Machine 300: NOT assigned to any shift (used for Part C and A.4.2)
+   - Machine 300, Station 1: MaxLogins = 1; Station 2: MaxLogins = 2
 4. **Test Operators**:
    - Operator 1: No special permissions
    - Operator 2: Has CANLOGOUTOFSHIFT permission
@@ -120,17 +149,19 @@ This test plan is divided into two parts:
 
 ---
 
-#### TEST A.2.3: CANREPLACEOPERATOR at Empty Station - DENIED
+#### TEST A.2.3: CANREPLACEOPERATOR at Empty Station - Initial Login ALLOWED
 **Time:** 10:07
 **Setup:**
 - Machine 100, Station 1 is empty (Operator 3 still at Station 2)
 - Logout Operator 3 from Station 2
 - Operator 3 scans Station 1 (now empty)
 
-**Expected Result:**
-- ❌ Login DENIED
-- ✅ LED turns ORANGE for 5 seconds
-- ✅ Log: "[SCENARIO A] Login DENIED: CANREPLACEOPERATOR requires someone to replace - station is empty"
+**Expected Result** (rule changed 2025-10-29: CANREPLACEOPERATOR only blocks *moving* to an empty
+station - see C.2.1 / D.2.1 - not an initial login):
+- ✅ Login successful
+- ✅ LED turns GREEN
+- ✅ Operator 3 assigned to Shift A
+- ✅ Log: "[ShiftManagement] Login to empty station"
 
 ---
 
@@ -177,9 +208,25 @@ This test plan is divided into two parts:
 - ✅ Login successful (legacy logic)
 - ✅ LED turns GREEN
 - ✅ Operator NOT assigned to shift (`ActiveShiftId` = null)
-- ✅ Log: "[SCENARIO A] Shift management disabled or no active shift - using legacy logic"
+- ✅ Log: "[ShiftManagement] Shift management disabled or no active shift - using legacy logic"
 
-**Cleanup:** Re-assign shifts to Machine 200
+**Cleanup:** Log Operator 1 out; re-assign shifts to Machine 200
+
+---
+
+#### TEST A.4.2: Leave a Shift Machine by Scanning an Unassigned Machine
+**Time:** 10:13
+**Setup:**
+- Operator 5 logged in at Machine 100, Station 1 (Shift A, outside delta, no permissions)
+- Operator 5 scans Machine 300, Station 1 (no shift assigned)
+
+**Expected Result** (current design: shift rules are decided by the machine being *scanned* -
+confirm with the customer this is acceptable during a pilot on some machines only):
+- ✅ Operator 5 logged out of Machine 100 (LED RED) and logged in at Machine 300 (LED GREEN)
+- ✅ `ActiveShiftId` = null
+- ✅ Log: "[ShiftManagement] Shift management disabled or no active shift - using legacy logic"
+
+**Cleanup:** Log Operator 5 out
 
 ---
 
@@ -441,7 +488,7 @@ This test plan is divided into two parts:
 #### TEST TM1.1: Auto-Logout at Shift End
 **Time:** 10:20:30 (Shift A ends at 10:20)
 **Setup:**
-- **AutoLogoutAtShiftEnd** = true
+- **AutoLogoutAtShiftEnd** = true (the default)
 - Before 10:20: Login Operator 1 at Machine 100, Station 1 at 10:00 (Shift A)
 - Wait for minute timer to trigger after 10:20
 
@@ -449,8 +496,7 @@ This test plan is divided into two parts:
 - ✅ Operator 1 auto-logged out
 - ✅ LED turns RED
 - ✅ `ActiveShiftId` cleared
-- ✅ Log: "[AutoLogout] LOGGING OUT: Operator 1, Machine 100"
-- ✅ Log: "[AutoLogout] === Auto-logout check complete: 1 operators logged out ==="
+- ✅ Log: "[AutoLogout] Operator 1 at Machine 100, Sub 1 logged out - shift Shift A ended at 10:20"
 
 **Verification:**
 - Operator 1: `IsLoggedIn` = false, `ActiveShiftId` = null
@@ -465,9 +511,9 @@ This test plan is divided into two parts:
 - Wait for minute timer after 10:40
 
 **Expected Result:**
-- ✅ All three operators auto-logged out
+- ✅ All three operators auto-logged out (Operator 2's CANLOGOUTOFSHIFT makes no difference)
 - ✅ LED turns RED
-- ✅ Log: "[AutoLogout] === Auto-logout check complete: 3 operators logged out ==="
+- ✅ Log: one "[AutoLogout] Operator ... logged out - shift Shift B ended at 10:40" line per operator
 
 ---
 
@@ -482,48 +528,50 @@ This test plan is divided into two parts:
 - ✅ No auto-logout
 - ✅ Operators remain logged in
 - ✅ LED stays GREEN
-- ✅ Log: "[AutoLogout] === Auto-logout check complete: 0 operators logged out ==="
+- ✅ No "[AutoLogout] Operator ..." lines (a check that does nothing logs nothing)
 
 ---
 
-#### TEST TM1.4: No Auto-Logout When Setting Disabled
+#### TEST TM1.4: No Auto-Logout When Setting Switched Off by SQL
 **Time:** 10:43
 **Setup:**
-- **AutoLogoutAtShiftEnd** = false
-- Login Operator 1 at Machine 100, Station 1
-- Manually trigger timer or wait
+- Set **AutoLogoutAtShiftEnd** = 'False' by SQL (see Prerequisites) and wait a minute
+- Login Operator 1 at Machine 100, Station 1 during a shift; wait for the shift to end
 
 **Expected Result:**
-- ✅ No auto-logout attempts
-- ✅ Log: "[AutoLogout] EXITING EARLY: UseShiftManagement=True, autoLogoutEnabled=False"
+- ✅ Log (once, within a minute of the SQL change): "[AutoLogout] Logout at shift end is OFF (AutoLogoutAtShiftEnd is switched off in tblShiftSettings)"
+- ✅ Operator 1 is not logged out at shift end
+- ✅ No "[AutoLogout] Operator ..." lines
 
 ---
 
-#### TEST TM1.5: Clear Orphaned Shift Reference
+#### TEST TM1.5: Operator's Shift Deleted
 **Time:** 10:44
 **Setup:**
-- Manually set Operator 1's `ActiveShiftId` = 999 (doesn't exist)
-- Trigger timer
+- Operator 1 logged in on a shift at Machine 100. Create a second shift with the same times, delete
+  Operator 1's shift in the Shift Editor (with its assignments), and assign the second shift to Machine 100
+- Wait for the minute timer
 
 **Expected Result:**
-- ✅ `ActiveShiftId` cleared to null
-- ✅ No auto-logout
-- ✅ Log: "[AutoLogout] Shift ID 999 NOT FOUND in database for Operator 1 - clearing orphaned shift info"
+- ✅ Operator 1 is **not** logged out
+- ✅ Operator 1 is moved to the shift now running on the machine -
+  Log: "[ShiftTransition] Operator 1 moved to shift [ID] ([name]) - shift ID [old ID] no longer exists"
+- ✅ If no shift is running on the machine instead: "[ShiftTransition] Operator 1 shift info cleared - shift ID [old ID] no longer exists, no shift running on the machine", and Operator 1 can log out freely
 
 ---
 
-#### TEST TM1.6: Auto-Logout Orphaned Login on Shift-Enabled Machine
+#### TEST TM1.6: Shift Start Rule - Login Without a Shift on a Machine Whose Shift Is Running
 **Time:** 10:45
 **Setup:**
-- **AutoLogoutAtShiftEnd** = true
-- Manually set Operator 1: logged in at Machine 100 but `ActiveShiftId` = null
-- Machine 100 has active shift
-- Trigger timer
+- Run once with **AutoLogoutAtShiftEnd** = true and once with false (the result must be the same)
+- Operator 1 logs in at Machine 100 a minute before a shift starts there (legacy login, `ActiveShiftId` = null)
+- Wait for the shift to start
 
 **Expected Result:**
-- ✅ Operator 1 logged out (orphaned login)
+- ✅ Operator 1 logged out within a minute of the shift start
 - ✅ LED turns RED
-- ✅ Log: "[AutoLogout] Operator 1 logged in without shift info on shift-enabled machine (shift: Shift B) - LOGGING OUT (orphaned login)"
+- ✅ Log: "[ShiftStart] Operator 1 at Machine 100, Sub 1 logged out - logged in without a shift and shift [name] is running on the machine"
+- ✅ Operator 1 scans again → logged in and assigned the shift
 
 ---
 
@@ -531,19 +579,21 @@ This test plan is divided into two parts:
 
 ### Test Group TM2: Shift Transition Check (Rule TM2)
 
+All TM2 tests need **AutoLogoutAtShiftEnd** = false, set by SQL.
+
 #### TEST TM2.1: Transition After Delta+ Expires to New Shift
 **Time:** 10:23 (Delta+ expires at 10:22, Shift B active)
 **Setup:**
 - **AutoLogoutAtShiftEnd** = false
 - Operator 1 logged in at 10:00 with Shift A
 - Still logged in after Shift A ended
-- Trigger timer at 10:23
+- Wait for the minute timer at 10:23
 
 **Expected Result:**
-- ✅ Operator 1 transitioned to Shift B
+- ✅ Operator 1 moved to Shift B
 - ✅ `ActiveShiftId` updated to Shift B ID
-- ✅ Operator remains logged in
-- ✅ Log: "[ShiftTransition] Operator 1 transitioned from shift [Shift A ID] to shift [Shift B ID] (Shift B)"
+- ✅ Operator remains logged in, and is now held to Shift B (a logout scan outside Shift B's delta is refused)
+- ✅ Log: "[ShiftTransition] Operator 1 moved to shift [Shift B ID] (Shift B) - shift Shift A has ended"
 
 ---
 
@@ -556,22 +606,22 @@ This test plan is divided into two parts:
 
 **Expected Result:**
 - ✅ No transition (still within grace period)
-- ✅ Operator still has Shift A info
-- ✅ Log: "[ShiftTransition] === Shift transition check complete: 0 transitions ==="
+- ✅ Operator still has Shift A info (a logout scan is allowed - within Delta+)
+- ✅ No "[ShiftTransition]" lines
 
 ---
 
-#### TEST TM2.3: Assign Shift to Operator Without Shift Info
-**Time:** 10:25
+#### TEST TM2.3: Operator Released After a Shift Is Logged Out When the Next Shift Starts
+**Time:** 10:25 onwards (needs a gap between two shifts on one machine - use Part D's Shifts P and Q, or temporarily move Shift B to start at 10:30)
 **Setup:**
-- Operator 1 logged in with no `ActiveShiftId` (logged in during gap)
-- Machine 100 has Shift B active
-- Trigger timer
+- **AutoLogoutAtShiftEnd** = false
+- Operator 1 logged in on the first shift; the shift ends and no shift follows straight away
+- Wait for the second shift to start
 
 **Expected Result:**
-- ✅ Operator 1 assigned to Shift B
-- ✅ `ActiveShiftId` = Shift B ID
-- ✅ Log: "[ShiftTransition] Operator 1 assigned to shift [Shift B ID] (Shift B) - shift started while logged in"
+- ✅ At the first shift's end (plus Delta+): "[ShiftTransition] Operator 1 shift info cleared - shift [name] has ended, no shift running on the machine"; Operator 1 stays logged in and can log out freely
+- ✅ When the second shift starts: Operator 1 is **logged out** - Log: "[ShiftStart] Operator 1 ... logged out - logged in without a shift and shift [name] is running on the machine"
+- ❌ Fails if Operator 1 is given the second shift and stays logged in ("assigned to shift ... - shift started while logged in" was the behaviour before v3.0)
 
 ---
 
@@ -585,8 +635,8 @@ This test plan is divided into two parts:
 **Expected Result:**
 - ✅ Auto-logout runs FIRST (Rule TM1)
 - ✅ Operator logged out
-- ✅ Transition check runs SECOND, skips operator (already logged out)
-- ✅ Log order: AutoLogout messages before ShiftTransition messages
+- ✅ Transition check runs SECOND, finds nothing to do
+- ✅ Log: "[AutoLogout] Operator 1 ..." and no "[ShiftTransition]" line for Operator 1
 
 ---
 
@@ -619,8 +669,8 @@ This test plan is divided into two parts:
 
 **Expected Result:**
 - ✅ Operator 2 kept logged in
-- ✅ `ActiveShiftId` = null
-- ✅ Log: "[ServiceStart] Operator 2 at Machine 200, Sub 1 - Kept logged in: no shift covered login, machine not using shifts"
+- ✅ `ActiveShiftId` = null (a logout scan is allowed)
+- ✅ No "[ServiceStart]" or "[ShiftStart]" line for Operator 2
 
 ---
 
@@ -635,7 +685,8 @@ This test plan is divided into two parts:
 **Expected Result:**
 - ✅ Operator 3 LOGGED OUT
 - ✅ `IsLoggedIn` = false
-- ✅ Log: "[ServiceStart] Operator 3 at Machine 200, Sub 1 - Logging out: no shift covered original login, but machine has active shift Shift B now"
+- ✅ Log: "[ShiftStart] Operator 3 at Machine 200, Sub 1 logged out - logged in without a shift and shift Shift B is running on the machine"
+- ✅ Every other operator who was logged in is restored correctly
 
 ---
 
@@ -821,8 +872,7 @@ This test plan is divided into two parts:
 - ✅ Operator 1 auto-logged out (shift ended at 10:00)
 - ✅ LED turns RED
 - ✅ `ActiveShiftId` cleared
-- ✅ Log: "[AutoLogout] LOGGING OUT: Operator 1, Machine 100"
-- ✅ Log: "[AutoLogout] === Auto-logout check complete: 1 operators logged out ==="
+- ✅ Log: "[AutoLogout] Operator 1 at Machine 100, Sub 1 logged out - shift Shift C ended at 10:00"
 
 **Critical Verification:**
 - ✅ Operator logged in at 4:30 PM YESTERDAY
@@ -850,11 +900,238 @@ This test plan is divided into two parts:
 
 ---
 
+# PART C: LEGACY PARITY TESTS
+
+**When:** any time of day, ~15 minutes. **Must pass before any site install.**
+
+**Purpose:** wherever shift rules don't apply, the service must behave exactly like the pre-shift
+service (installer v1.1.51): scanning logs you in or out, a MaxLogins = 1 station replaces its
+occupant, a full multi-login station refuses, and scanning elsewhere moves you.
+
+**Run Section C.1 twice:**
+1. With `UseShiftManagement` = false in the service config (restart the service after changing it)
+2. With `UseShiftManagement` = true, using Machine 300 (no shift assigned)
+
+`UseOperatorPermissions` = false for these tests. Every operator should end each test logged out
+unless stated.
+
+---
+
+## SECTION C.1: No Shift Rules Apply
+
+#### TEST LP.1: Login to Empty Station
+**Setup:** Machine 300, Station 1 empty. Operator 1 scans Machine 300, Station 1.
+
+**Expected Result:**
+- ✅ Operator 1 logged in, LED GREEN
+- ✅ `ActiveShiftId` = null
+- ✅ Log: "[ShiftManagement] Shift management disabled or no active shift - using legacy logic"
+
+---
+
+#### TEST LP.2: Logout at Own Station
+**Setup:** Continuing LP.1, Operator 1 scans Machine 300, Station 1 again.
+
+**Expected Result:**
+- ✅ Operator 1 logged out, LED RED
+
+---
+
+#### TEST LP.3: Single-Login Station Replaces Occupant
+**Setup:** Operator 1 logged in at Machine 300, Station 1 (MaxLogins = 1). Operator 5 scans Machine 300, Station 1.
+
+**Expected Result:**
+- ✅ Operator 1 logged out
+- ✅ Operator 5 logged in, LED GREEN
+
+---
+
+#### TEST LP.4: Full Multi-Login Station Refuses
+**Setup:** Operators 1 and 2 logged in at Machine 300, Station 2 (MaxLogins = 2). Operator 5 (not logged in) scans Machine 300, Station 2.
+
+**Expected Result:**
+- ✅ Operator 5 NOT logged in
+- ✅ Operators 1 and 2 still logged in, LED stays GREEN
+- ✅ Log: "[ShiftManagement] Legacy login refused - station full: Machine 300, Sub 2, MaxLogins 2"
+
+---
+
+#### TEST LP.5: Move Station, Same Machine
+**Setup:** Operator 1 logged in at Machine 300, Station 1. Machine 300, Station 2 has a free slot. Operator 1 scans Machine 300, Station 2.
+
+**Expected Result:**
+- ✅ Operator 1 logged out of Station 1 (LED RED) and logged in at Station 2 (LED GREEN)
+
+---
+
+#### TEST LP.6: Move to a Different Machine
+**Setup:** Operator 1 logged in at Machine 300, Station 2. Operator 1 scans a station on another machine
+with no active shift (in the `UseShiftManagement` = true pass, use Machine 200 outside Shifts A/B, or
+another unassigned machine).
+
+**Expected Result:**
+- ✅ Operator 1 logged out of Machine 300 (LED RED) and logged in at the new machine (LED GREEN)
+- ✅ Operator 1 appears once in `RemoteOperatorLog` as logged in, at the new machine
+
+---
+
+## SECTION C.2: Gaps Between Shifts and Operator Reload (`UseShiftManagement` = true)
+
+#### TEST LP.7: Login During a Gap, Then the Shift Starts
+**Setup:**
+- Create Shift R starting ~5 minutes from now (20 minutes long) and assign it to Machine 300 for today
+- Before Shift R starts, Operator 1 scans Machine 300, Station 1
+- Wait for Shift R to start
+
+**Expected Result:**
+- ✅ Before the start: Operator 1 logged in by legacy logic, `ActiveShiftId` = null
+- ✅ Within a minute of the start: Operator 1 logged out (shift start rule, as TM1.6) - the same with
+  `AutoLogoutAtShiftEnd` true or false
+- ✅ Operator 1 scans again → logged in and assigned Shift R
+
+---
+
+#### TEST LP.8: Operator Reload Keeps the Shift
+**Setup:** Continue from LP.7 with Operator 1 logged in and assigned Shift R.
+Force an operator reload by editing any row in `JEGR_DB.dbo.tblOperators` (or wait up to 15 minutes).
+
+**Expected Result:**
+- ✅ Operator 1 still logged in, still assigned Shift R (a logout scan is still refused)
+- ✅ Log: "[Reload] Operator 1 at Machine 300, Sub 1 - kept shift ID ..."
+- ❌ Fails if Operator 1 is logged out, or can now log out by scanning
+
+**Cleanup:** Delete Shift R (with its assignment) once Operator 1 is logged out
+
+---
+
+# PART D: BREAKS, DEFAULTS AND THE SHIFT EDITOR
+
+**When:** any time of day, ~30 minutes. New in v3.0.
+
+**Setup for Part D:**
+- `AutoLogoutAtShiftEnd` = True (after `schema.sql` it is)
+- In the Shift Editor create two shifts (they get Delta 0), starting about 5 minutes from now:
+  - **Shift P**: 15 minutes long, on Machine 100, with one break 5 minutes after its start
+  - **Shift Q**: starts 5 minutes after Shift P ends, 10 minutes long, on Machine 100, no breaks
+- Machine 300 stays without shifts. No restart is needed after saving - wait a minute
+
+Times below are relative to Shift P's start (P+0).
+
+---
+
+## SECTION D.1: What the Shift Editor Shows
+
+#### TEST ED.1: Hidden Settings
+**Setup:** Open the Shift Editor.
+
+**Expected Result:**
+- ✅ Tabs: **Shifts** and **Operator Settings** only - no Shift Settings tab
+- ✅ Shifts grid: Shift ID, Shift Name, Start Time, End Time, Active - no Delta columns
+- ✅ Nothing on any screen shows or mentions Delta, grace minutes or AutoLogoutAtShiftEnd
+- ✅ In the database the setting row and the Delta columns still exist:
+  `SELECT * FROM JEGR_Utils.dbo.tblShiftSettings` / `SELECT ShiftName, DeltaMinus, DeltaPlus FROM JEGR_Utils.dbo.tblShifts`
+
+(The editor's own screens are covered in detail by `testing/SHIFT_EDITOR_UI_CHECKLIST.md`.)
+
+---
+
+## SECTION D.2: Held to the Shift, Breaks, Shift End
+
+#### TEST BR.1: Held to the Shift With Delta 0
+**Time:** P+1
+**Setup:** Operators 1 and 5 log in at Machine 100 (Stations 1 and 2); Operator 2 (CANLOGOUTOFSHIFT) logs in at Station 2. Operator 1 scans Station 1 again, then scans Station 2.
+
+**Expected Result:**
+- ✅ Both scans refused: LED ORANGE, Operator 1 still logged in at Station 1, no new record in `RemoteOperatorLog`
+
+---
+
+#### TEST BR.2: Break Logs Out Everyone on the Shift
+**Time:** P+5 (the break)
+**Setup:** Nobody scans. Watch the readers at P+5.
+
+**Expected Result:**
+- ✅ Within a few seconds of P+5: Operators 1, 5 and 2 logged out (the permission makes no difference), LEDs RED
+- ✅ Log: "[Break] Operator 1 at Machine 100, Sub 1 logged out - break at [P+5]" (one line per operator)
+- ✅ `RemoteOperatorLog`: an ordinary logout record for each (State 0, SubregType 0)
+- ✅ An operator logged in at Machine 300 (no shift) is not affected
+
+---
+
+#### TEST BR.3: Logging Back In After the Break
+**Time:** P+5 to P+7
+**Setup:** Operator 1 scans Station 1 (same station). Operator 5 scans Station 1 on Machine 200 if it has a running shift, otherwise a different station on Machine 100.
+
+**Expected Result:**
+- ✅ Both logged in and assigned the shift of the machine they scanned
+- ✅ At P+6 and P+7 neither is logged out again by the same break
+- ✅ Operator 1 is held again (a logout scan is refused)
+
+---
+
+#### TEST BR.4: Break Added While the Shift Is Running
+**Time:** P+7
+**Setup:** In the Shift Editor add a break at P+9 to Shift P and **Save Breaks**. Operator 1 stays logged in.
+
+**Expected Result:**
+- ✅ At P+9 Operator 1 is logged out - Log: "[Break] Operator 1 ... logged out - break at [P+9]"
+- ✅ No service restart was needed
+
+---
+
+#### TEST BR.5: Break Missed While the Service Was Stopped
+**Time:** P+10 to P+12
+**Setup:** Operator 1 logs in again. Add a break at P+12 (Save Breaks). Stop the shift service at P+11:30 and start it at P+12:30.
+
+**Expected Result:**
+- ✅ Shortly after the start Operator 1 is logged out by the P+12 break
+- ✅ Log: "[ServiceStart] Operator 1 ... Assigned to shift Shift P ..." then "[Break] Operator 1 ... logged out - break at [P+12]"
+
+---
+
+#### TEST BR.6: Shift End With the Default Setting
+**Time:** P+15
+**Setup:** Operator 1 and Operator 2 log in again before P+15 and stay logged in.
+
+**Expected Result:**
+- ✅ At P+15 both are logged out, LEDs RED - Log: "[AutoLogout] Operator 1 ... logged out - shift Shift P ended at [P+15]"
+- ✅ Between P+15 and P+20 (gap) logins and logouts at Machine 100 follow the legacy rules
+
+---
+
+#### TEST BR.7: Gap Login Logged Out at the Next Shift's Start
+**Time:** P+18 to P+20
+**Setup:** Operator 5 logs in at Machine 100 at P+18 (in the gap). Shift Q starts at P+20.
+
+**Expected Result:**
+- ✅ At P+20 Operator 5 is logged out - Log: "[ShiftStart] Operator 5 ... logged out - logged in without a shift and shift Shift Q is running on the machine"
+- ✅ Operator 5 scans again → logged in and assigned Shift Q
+
+---
+
+#### TEST BR.8: Missing Setting Row Counts as On
+**Time:** during Shift Q
+**Setup:** `DELETE FROM JEGR_Utils.dbo.tblShiftSettings WHERE SettingName = 'AutoLogoutAtShiftEnd'`. Operator 5 stays logged in on Shift Q until it ends.
+
+**Expected Result:**
+- ✅ Operator 5 is logged out at Shift Q's end
+- ✅ No "[AutoLogout] Logout at shift end is OFF" line
+
+**Cleanup:** run `schema.sql` again (it puts the setting row back as 'True'); delete Shifts P and Q
+
+---
+
 ## TEST EXECUTION CHECKLIST
+
+### Pre-Test Setup (Legacy Parity)
+- [ ] Machine 300 has no shift assignments; Station 1 MaxLogins = 1, Station 2 MaxLogins = 2
+- [ ] `UseOperatorPermissions` = false
+- [ ] Pass 1: `UseShiftManagement` = false, service restarted
+- [ ] Pass 2: `UseShiftManagement` = true, service restarted
 
 ### Pre-Test Setup (Daytime)
 - [ ] Database configured with Shift A (10:00-10:20), Shift B (10:20-10:40)
-- [ ] Both shifts: DeltaMinus=2, DeltaPlus=2
+- [ ] Both shifts: DeltaMinus=2, DeltaPlus=2 (set by SQL - see Prerequisites); no break times
 - [ ] Test machines configured with correct MaxLogins
 - [ ] Test operators configured with correct permissions
 - [ ] UseShiftManagement = true
@@ -863,10 +1140,15 @@ This test plan is divided into two parts:
 
 ### Pre-Test Setup (Overnight)
 - [ ] Database configured with Shift C (16:00-10:00)
-- [ ] Shift C: DeltaMinus=15, DeltaPlus=10
-- [ ] Machine 100 assigned to Shift C
+- [ ] Shift C: DeltaMinus=15, DeltaPlus=10 (set by SQL)
+- [ ] Machine 100 assigned to Shift C for **both** days it touches
 - [ ] AutoLogoutAtShiftEnd = true for MC.1
-- [ ] AutoLogoutAtShiftEnd = false for MC.2 and MC.3
+- [ ] AutoLogoutAtShiftEnd = false (by SQL) for MC.2 and MC.3
+- [ ] Fixed-time auto-logout (`AutoLogout` in the service config) off, or its time outside the test
+
+### Pre-Test Setup (Part D)
+- [ ] `schema.sql` (current version) has been run: `tblShiftBreaks` exists, AutoLogoutAtShiftEnd = True
+- [ ] Shifts P and Q created in the Shift Editor (Delta 0), Shift P with a break; Machine 300 without shifts
 
 ### During Testing
 - [ ] Monitor feedback logs for expected messages
@@ -910,11 +1192,11 @@ This test plan is divided into two parts:
 
 **Daytime Test (Part A):**
 - Duration: 60 minutes (10:00-11:00 AM)
-- Total Test Cases: 48 tests
+- Total Test Cases: 41 tests (v2.0 said 48; the breakdown below is the actual count)
 - Coverage: All SCENARIOS A-D, Timer Logic (TM1, TM2), Service Recovery (SS1), Edge Cases
 
 **Breakdown by Section:**
-- SCENARIO A (Not Logged In): 7 tests
+- SCENARIO A (Not Logged In): 8 tests
 - SCENARIO B (Logout): 5 tests
 - SCENARIO C (Same Machine): 6 tests
 - SCENARIO D (Different Machine): 5 tests
@@ -928,8 +1210,18 @@ This test plan is divided into two parts:
 - Total Test Cases: 3 tests
 - Coverage: Midnight crossing for auto-logout, manual logout, and same-day login
 
+**Legacy Parity Test (Part C):**
+- Duration: ~15 minutes (LP.1-LP.6 run twice: shift management off, and on with an unassigned machine)
+- Total Test Cases: 8 tests
+- Coverage: pre-shift behaviour where no shift applies, gaps between shifts, operator reload
+
+**Breaks, Defaults and the Shift Editor (Part D):**
+- Duration: ~30 minutes
+- Total Test Cases: 9 tests
+- Coverage: hidden settings, held to the shift with delta 0, breaks (logout, re-login, added while running, missed during a restart), shift end by default, shift start rule, missing setting row
+
 **Total Test Coverage:**
-- All Rules: A.1.1, A.1.2, A.2, A.3, B.1, C (two-step), D (two-step), TM1, TM2, SS1 ✅
+- All Rules: A.1.1, A.1.2, A.2, A.3, B.1, C (two-step), D (two-step), TM0 (shift start), TM1, TM2, TM3 (breaks), SS1 ✅
 - All Permissions: CANLOGOUTOFSHIFT, CANREPLACEOPERATOR ✅
 - All Edge Cases: Midnight crossing, permission combinations ✅
 - All Prerequisites: UseShiftManagement, active shift checks ✅
