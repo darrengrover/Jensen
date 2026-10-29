@@ -59,7 +59,7 @@ The scripts only start one after the other has stopped, and disable whichever is
    - Run `sc qc Cockpit_Central_Operator_Shift` - `BINARY_PATH_NAME` must be in the `_Shift` folder
 5. **Shift Editor** - on each PC that needs it
    - Run `CentralOperatorShiftEditorSetup.msi` as Administrator (or its `setup.exe`, which installs
-     .NET Framework 4.8 first if the PC doesn't have it). It installs to
+     .NET Framework 4.7.2 first if the PC doesn't have it). It installs to
      `C:\Program Files (x86)\Jensen\CentralOperatorShiftEditor\` with a Start-menu and a desktop shortcut,
      both starting in that folder
    - Copy the site's `DBConnections.xml` into that folder - the editor reads it from there. If the site

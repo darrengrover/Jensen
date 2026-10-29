@@ -100,10 +100,10 @@
             "ComponentsUrl" = "8:"
                 "Items"
                 {
-                    "{EDC2488A-8267-493A-A98E-7D9C3B36CDF3}:.NETFramework,Version=v4.8"
+                    "{EDC2488A-8267-493A-A98E-7D9C3B36CDF3}:.NETFramework,Version=v4.7.2"
                     {
-                    "Name" = "8:Microsoft .NET Framework 4.8 (x86 and x64)"
-                    "ProductCode" = "8:.NETFramework,Version=v4.8"
+                    "Name" = "8:Microsoft .NET Framework 4.7.2 (x86 and x64)"
+                    "ProductCode" = "8:.NETFramework,Version=v4.7.2"
                     }
                 }
             }
@@ -132,10 +132,10 @@
             "ComponentsUrl" = "8:"
                 "Items"
                 {
-                    "{EDC2488A-8267-493A-A98E-7D9C3B36CDF3}:.NETFramework,Version=v4.8"
+                    "{EDC2488A-8267-493A-A98E-7D9C3B36CDF3}:.NETFramework,Version=v4.7.2"
                     {
-                    "Name" = "8:Microsoft .NET Framework 4.8 (x86 and x64)"
-                    "ProductCode" = "8:.NETFramework,Version=v4.8"
+                    "Name" = "8:Microsoft .NET Framework 4.7.2 (x86 and x64)"
+                    "ProductCode" = "8:.NETFramework,Version=v4.7.2"
                     }
                 }
             }
@@ -160,7 +160,7 @@
                 {
                 "Name" = "8:.NET Framework"
                 "Message" = "8:[VSDNETMSG]"
-                "FrameworkVersion" = "8:.NETFramework,Version=v4.8"
+                "FrameworkVersion" = "8:.NETFramework,Version=v4.7.2"
                 "AllowLaterVersions" = "11:FALSE"
                 "InstallUrl" = "8:http://go.microsoft.com/fwlink/?LinkId=863262"
                 }
@@ -349,7 +349,7 @@
         "Name" = "8:Microsoft Visual Studio"
         "ProductName" = "8:Central Operator Shift Editor"
         "ProductCode" = "8:{8E5B7F78-9BF9-4028-9615-FBBBA510E405}"
-        "PackageCode" = "8:{9C1DB2DB-7307-4993-BFC4-9F8D8ABDF56F}"
+        "PackageCode" = "8:{EB913DA5-CA8E-45AD-999B-A8BD6AD8A5FA}"
         "UpgradeCode" = "8:{77DE7AFA-E0D0-4A2F-929F-F913DFAF22A2}"
         "AspNetVersion" = "8:4.0.30319.0"
         "RestartWWWService" = "11:FALSE"
